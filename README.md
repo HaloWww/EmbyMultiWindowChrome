@@ -24,10 +24,20 @@ Chrome Manifest V3 扩展。它把多个 Emby 播放会话放入一个普通的�
 
 ## 安装
 
+### 下载版
+
+1. 下载 [`dist/EmbyMultiWindowChrome-0.7.7.zip`](dist/EmbyMultiWindowChrome-0.7.7.zip)。
+2. 解压到一个固定目录。
+3. 打开 `chrome://extensions/`。
+4. 开启“开发者模式”。
+5. 点击“加载已解压的扩展程序”，选择解压后的目录。
+
+### 源码版
+
 1. 打开 `chrome://extensions/`。
 2. 开启“开发者模式”。
 3. 点击“加载已解压的扩展程序”。
-4. 选择本目录 `EmbyMultiWindowChrome`。
+4. 选择仓库根目录 `EmbyMultiWindowChrome`。
 
 默认启用 `localhost` 和 `127.0.0.1`。局域网 IP、端口或域名可以直接在扩展
 设置页的“适配的网址”中添加，不需要修改 `manifest.json`。省略端口表示允许
