@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Emby 多画面设置</title>
+    <link rel="stylesheet" href="options.css">
+</head>
+<body>
+    <main>
+        <header>
+            <div class="mark">▦</div>
+            <div>
+                <h1>Emby 多画面设置</h1>
+                <p>设置会自动应用到已打开的多画面窗口。</p>
+            </div>
+        </header>
+
+        <section>
+            <h2>适配的网址</h2>
+            <p class="explain site-help">
+                只有列表中的 HTTP/HTTPS 地址会加载 Emby 多画面功能。省略端口表示允许该主机的任意端口。
+            </p>
+            <div class="site-editor">
+                <input id="siteInput" type="text"
+                    placeholder="例如：http://192.168.8.8:8096"
+                    aria-label="Emby 服务器网址">
+                <button id="addSite" type="button">添加网址</button>
+            </div>
+            <div id="siteError" role="alert"></div>
+            <ul id="siteList" aria-label="已适配的网址"></ul>
+            <p class="site-note">支持示例：<code>https://emby.example.com</code>、<code>https://*.example.com</code>。修改后请刷新 Emby 页面。</p>
+        </section>
+
+        <section>
+            <div class="setting-head">
+                <label for="previewWidth">进度预览窗口宽度</label>
+                <output id="previewWidthValue" for="previewWidth">280 px</output>
+            </div>
+            <input id="previewWidth" type="range" min="180" max="520" step="10" value="280">
+            <div class="scale"><span>180 px</span><span>520 px</span></div>
+            <div id="previewSample">
+                <div class="sample-image">预览画面</div>
+                <div class="sample-time">章节名称 · 12:34</div>
+            </div>
+        </section>
+
+        <section>
+            <h2>循环片段缓存</h2>
+            <p class="explain cache-help">
+                普通播放始终优先直连，不会写入扩展缓存。选择循环片段后才会完整预取对应 HLS 分片，完成后停止服务器转码并从内存循环；关闭画面后立即释放该路缓存。
+            </p>
+            <div class="cache-setting">
+                <label for="mediaCacheMode">片段缓存方式</label>
+                <select id="mediaCacheMode">
+                    <option value="memory">每路内存缓存</option>
+                    <option value="off">关闭缓存，在线循环</option>
+                </select>
+            </div>
+            <div id="cacheLimitRow">
+                <div class="setting-head">
+                    <label for="mediaCacheLimitMb">每路最大缓存</label>
+                    <output id="mediaCacheLimitValue" for="mediaCacheLimitMb">4 GB</output>
+                </div>
+                <input id="mediaCacheLimitMb" type="range"
+                    min="256" max="16384" step="256" value="4096">
+                <div class="scale"><span>256 MB</span><span>16 GB</span></div>
+            </div>
+            <p class="site-note">
+                容量上限只用于片段完整预取。关闭片段缓存后，选中的片段仍会循环，但会继续读取服务器。直连 MP4 的 HTTP 缓存仍由 Chrome 和 Emby 的 Range 策略控制。
+            </p>
+        </section>
+
+        <section>
+            <h2>多画面窗口</h2>
+            <p class="explain">窗口大小会在拖动后自动记忆。重置后，下次新建窗口使用 1100 × 720。</p>
+            <button id="resetWindow" type="button">恢复默认窗口大小</button>
+        </section>
+
+        <div id="saved" role="status">设置已保存</div>
+    </main>
+    <script src="options.js"></script>
+</body>
+</html>

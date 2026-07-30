@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Emby 多画面</title>
+    <link rel="stylesheet" href="player.css">
+</head>
+<body>
+    <main id="stage" aria-live="polite">
+        <div id="grid"></div>
+        <div id="windowTools">
+            <button id="newWindow" type="button" title="新建一个独立的多画面窗口">
+                <span aria-hidden="true">＋</span>
+                <span>新建窗口</span>
+            </button>
+        </div>
+        <div id="empty">
+            <div class="empty-icon">▦</div>
+            <div>在 Emby 视频详情页或播放页点击“加入更多画面”</div>
+        </div>
+        <div id="toast" role="status"></div>
+    </main>
+    <script src="amd-shim.js"></script>
+    <script src="hls.js"></script>
+    <script src="player.js"></script>
+</body>
+</html>

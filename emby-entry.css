@@ -1,0 +1,69 @@
+#emby-multiwindow-toast {
+    position: fixed;
+    right: 22px;
+    bottom: 22px;
+    z-index: 2147483647;
+    max-width: min(380px, calc(100vw - 44px));
+    padding: 11px 14px;
+    border: 1px solid rgba(255, 255, 255, .16);
+    border-radius: 8px;
+    color: #fff;
+    background: rgba(16, 16, 16, .96);
+    box-shadow: 0 8px 30px rgba(0, 0, 0, .42);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(8px);
+    transition: opacity .18s ease, transform .18s ease;
+}
+
+#emby-multiwindow-toast.is-visible {
+    opacity: 1;
+    transform: translateY(0);
+}
+
+.emby-multiwindow-detail-button {
+    display: inline-flex;
+    align-items: center;
+    gap: .5em;
+}
+
+.emby-multiwindow-icon {
+    color: #52b54b;
+    font-size: 1.15em;
+}
+
+#emby-multiwindow-launcher {
+    position: fixed;
+    right: 22px;
+    bottom: max(22px, env(safe-area-inset-bottom));
+    z-index: 2147483646;
+    display: inline-flex;
+    min-height: 42px;
+    align-items: center;
+    gap: 8px;
+    padding: 0 16px;
+    border: 1px solid rgba(255, 255, 255, .2);
+    border-radius: 999px;
+    color: #fff;
+    background: rgba(18, 18, 18, .92);
+    box-shadow: 0 6px 24px rgba(0, 0, 0, .35);
+    font: 600 14px/1 system-ui, -apple-system, "Segoe UI", sans-serif;
+    cursor: pointer;
+    transition: background .16s ease, opacity .16s ease, transform .16s ease;
+}
+
+#emby-multiwindow-launcher[hidden] {
+    display: none;
+}
+
+#emby-multiwindow-launcher:hover {
+    background: rgba(35, 35, 35, .98);
+    transform: translateY(-1px);
+}
+
+#emby-multiwindow-launcher:disabled,
+.emby-multiwindow-detail-button:disabled {
+    cursor: wait;
+    opacity: .62;
+}

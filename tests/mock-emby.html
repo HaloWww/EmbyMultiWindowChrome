@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <title>Emby Multi Window entry smoke test</title>
+    <link rel="stylesheet" href="../emby-entry.css">
+    <script>
+        window.__embyMultiWindowTestMode = true;
+        window.Emby = {
+            importModule: function () {
+                return Promise.reject(new Error('Playback modules are not used by this test.'));
+            }
+        };
+        window.ApiClient = {
+            getPlaybackInfo: function () {},
+            isLoggedIn: function () { return true; }
+        };
+    </script>
+    <script defer src="../emby-entry.js"></script>
+</head>
+<body>
+    <section class="itemView">
+        <div class="mainDetailButtons"></div>
+        <video src="data:video/mp4;base64," style="display:block;width:640px;height:360px"></video>
+    </section>
+    <script>
+        window.addEventListener('load', function () {
+            document.querySelector('.itemView').dispatchEvent(new CustomEvent('itemshow', {
+                bubbles: true,
+                detail: {
+                    item: {
+                        Id: 'mock-video',
+                        Name: 'Mock Video',
+                        Type: 'Movie',
+                        MediaType: 'Video',
+                        UserData: {PlaybackPositionTicks: 0}
+                    }
+                }
+            }));
+        });
+    </script>
+</body>
+</html>
