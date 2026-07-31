@@ -4,6 +4,9 @@
     var slider = document.getElementById('previewWidth');
     var output = document.getElementById('previewWidthValue');
     var sample = document.getElementById('previewSample');
+    var controlsIdle = document.getElementById('controlsIdleSeconds');
+    var controlsIdleValue =
+        document.getElementById('controlsIdleSecondsValue');
     var resetButton = document.getElementById('resetWindow');
     var siteInput = document.getElementById('siteInput');
     var addSiteButton = document.getElementById('addSite');
@@ -20,6 +23,9 @@
     var MIN_MEDIA_CACHE_LIMIT_MB = 256;
     var MAX_MEDIA_CACHE_LIMIT_MB = 16384;
     var MEDIA_CACHE_LIMIT_VERSION = 2;
+    var DEFAULT_CONTROLS_IDLE_SECONDS = 2.5;
+    var MIN_CONTROLS_IDLE_SECONDS = 0.5;
+    var MAX_CONTROLS_IDLE_SECONDS = 30;
     var DEFAULT_ALLOWED_SITES = [
         'http://localhost',
         'https://localhost',
@@ -36,6 +42,26 @@
         slider.value = String(value);
         output.value = value + ' px';
         sample.style.width = value + 'px';
+    }
+
+    function clampControlsIdleSeconds(value) {
+        value = Number(value);
+        if (!Number.isFinite(value)) {
+            value = DEFAULT_CONTROLS_IDLE_SECONDS;
+        }
+        return Math.max(
+            MIN_CONTROLS_IDLE_SECONDS,
+            Math.min(
+                MAX_CONTROLS_IDLE_SECONDS,
+                Math.round(value * 2) / 2
+            )
+        );
+    }
+
+    function renderControlsIdle(value) {
+        value = clampControlsIdleSeconds(value);
+        controlsIdle.value = String(value);
+        controlsIdleValue.value = String(value).replace(/\.0$/, '') + ' 秒';
     }
 
     function flashSaved(message) {
@@ -152,6 +178,16 @@
             flashSaved();
         });
     });
+    controlsIdle.addEventListener('input', function () {
+        renderControlsIdle(controlsIdle.value);
+    });
+    controlsIdle.addEventListener('change', function () {
+        var value = clampControlsIdleSeconds(controlsIdle.value);
+        renderControlsIdle(value);
+        chrome.storage.sync.set({controlsIdleSeconds: value}).then(function () {
+            flashSaved('控件隐藏延迟已保存');
+        });
+    });
     resetButton.addEventListener('click', function () {
         chrome.storage.sync.set({
             windowWidth: 1100,
@@ -189,6 +225,7 @@
 
     chrome.storage.sync.get({
         previewWidth: 280,
+        controlsIdleSeconds: DEFAULT_CONTROLS_IDLE_SECONDS,
         allowedSites: DEFAULT_ALLOWED_SITES,
         mediaCacheMode: 'memory',
         mediaCacheLimitMb: DEFAULT_MEDIA_CACHE_LIMIT_MB,
@@ -208,6 +245,7 @@
             });
         }
         render(settings.previewWidth);
+        renderControlsIdle(settings.controlsIdleSeconds);
         allowedSites = Array.isArray(settings.allowedSites) ?
             settings.allowedSites.slice() : DEFAULT_ALLOWED_SITES.slice();
         renderSites();

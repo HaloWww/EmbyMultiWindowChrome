@@ -195,7 +195,8 @@ output {
     font-variant-numeric: tabular-nums;
 }
 
-#previewWidth {
+#previewWidth,
+#controlsIdleSeconds {
     width: 100%;
     accent-color: #52b54b;
 }

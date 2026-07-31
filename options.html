@@ -46,6 +46,20 @@
         </section>
 
         <section>
+            <div class="setting-head">
+                <label for="controlsIdleSeconds">控件自动隐藏延迟</label>
+                <output id="controlsIdleSecondsValue"
+                    for="controlsIdleSeconds">2.5 秒</output>
+            </div>
+            <input id="controlsIdleSeconds" type="range"
+                min="0.5" max="30" step="0.5" value="2.5">
+            <div class="scale"><span>0.5 秒</span><span>30 秒</span></div>
+            <p class="site-note">
+                鼠标、键盘停止操作后，标题、播放控件和缓存进度提示会在设定时间后一起隐藏。
+            </p>
+        </section>
+
+        <section>
             <h2>循环片段缓存</h2>
             <p class="explain cache-help">
                 普通播放始终优先直连，不会写入扩展缓存。选择循环片段后才会完整预取对应 HLS 分片，完成后停止服务器转码并从内存循环；关闭画面后立即释放该路缓存。

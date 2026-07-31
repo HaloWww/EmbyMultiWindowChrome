@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Emby Multi Window",
   "description": "Play multiple Emby videos in a dedicated minimal Chrome window.",
-  "version": "0.7.7",
+  "version": "0.7.24",
   "minimum_chrome_version": "116",
   "permissions": [
     "storage",

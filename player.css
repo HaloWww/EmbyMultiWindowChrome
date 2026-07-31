@@ -409,6 +409,7 @@ body {
 
 .title,
 .close,
+.status,
 .controls {
     transition: opacity .18s ease;
 }
@@ -417,6 +418,8 @@ body {
 .controls-hidden .close,
 .controls-hidden .drag-handle,
 .controls-hidden #windowTools,
+.controls-hidden .status[data-phase="clip-cache"],
+.controls-hidden .status[data-phase="memory-ready"],
 .controls-hidden .controls {
     opacity: 0;
     pointer-events: none;

@@ -6,7 +6,7 @@
     }
     window.__embyMultiWindowLoaded = true;
 
-    var VERSION = '0.7.7';
+    var VERSION = '0.7.24';
     var READY_RETRY_MS = 700;
     var MODULE_ROOT = './modules/';
     var SEGMENT_STORAGE_KEY = 'embySegmentLoop.v1';
@@ -216,13 +216,23 @@
         var profile = String(videoStream.Profile || '').toLowerCase();
         var pixelFormat = String(videoStream.PixelFormat || '').toLowerCase();
         var bitDepth = Number(videoStream.BitDepth) || 0;
+        var width = Number(videoStream.Width) || 0;
+        var height = Number(videoStream.Height) || 0;
+        var frameRate = Number(videoStream.RealFrameRate ||
+            videoStream.AverageFrameRate) || 0;
+        var level = Number(videoStream.Level) || 0;
+        var levelCode = level > 0 && level < 10 ? level * 10 : level;
+        var bitrate = Number(videoStream.BitRate || source.Bitrate) || 0;
         var mime;
         if (codec === 'hevc' || codec === 'h265') {
             return false;
         }
         if (codec === 'h264' || codec === 'avc') {
             if (bitDepth > 8 || /high\s*10|high\s*4:|4:4:4/.test(profile) ||
-                (pixelFormat && !/^(yuvj?420p|nv12)$/.test(pixelFormat))) {
+                (pixelFormat && !/^(yuvj?420p|nv12)$/.test(pixelFormat)) ||
+                levelCode > 52 ||
+                (width && height && width * height > 3840 * 2160) ||
+                frameRate > 60 || bitrate > 40000000) {
                 return false;
             }
             mime = 'video/mp4; codecs="avc1.42E01E"';
@@ -241,10 +251,6 @@
     }
 
     function requestPlaybackInfo(client, item, profile, context) {
-        var requestedSource = context.mediaSource ||
-            (item.MediaSources && item.MediaSources[0]) || null;
-        var canCopyVideo = !!requestedSource &&
-            canBrowserPlayMediaSource(requestedSource);
         var options = {
             UserId: client.getCurrentUserId(),
             StartTimeTicks: context.positionTicks || 0,
@@ -254,7 +260,13 @@
             // is built separately so the player window can choose either one.
             EnableDirectPlay: false,
             EnableDirectStream: false,
-            AllowVideoStreamCopy: canCopyVideo,
+            // The visible pane still opens the original file directly. The HLS
+            // path exists specifically for a cached loop, so it must have
+            // encoder-created keyframes at the HLS boundaries. Stream-copying
+            // long-GOP H.264 can produce (for example) 10.4 seconds of media in
+            // a playlist entry advertised as 6 seconds, shifting the cached
+            // content away from the segment timestamps selected on the MP4.
+            AllowVideoStreamCopy: false,
             AllowAudioStreamCopy: true,
             MaxStreamingBitrate: 40000000
         };
@@ -305,8 +317,13 @@
 
     function forceCompatibleTranscodeUrl(url) {
         var compatibleUrl = new URL(url, location.href);
+        Array.from(compatibleUrl.searchParams.keys()).forEach(function (key) {
+            if (key.toLowerCase() === 'allowvideostreamcopy') {
+                compatibleUrl.searchParams.delete(key);
+            }
+        });
         compatibleUrl.searchParams.set('VideoCodec', 'h264');
-        compatibleUrl.searchParams.set('allowVideoStreamCopy', 'false');
+        compatibleUrl.searchParams.set('AllowVideoStreamCopy', 'false');
         compatibleUrl.searchParams.set('h264-profile', 'high,main,baseline');
         compatibleUrl.searchParams.set('h264-level', '52');
         compatibleUrl.searchParams.set('SegmentContainer', 'ts');
@@ -321,9 +338,10 @@
         var playSessionId = playbackInfo.PlaySessionId || randomId('window-session-');
         var streamUrl = /^https?:/i.test(source.TranscodingUrl) ?
             source.TranscodingUrl : client.getUrl(source.TranscodingUrl);
-        if (!canBrowserPlayMediaSource(source)) {
-            streamUrl = forceCompatibleTranscodeUrl(streamUrl);
-        }
+        // Cache streams must be timestamp-accurate even when the browser can
+        // direct-play the source. Long-GOP stream copy makes Emby's nominal
+        // HLS durations diverge from the TS presentation timestamps.
+        streamUrl = forceCompatibleTranscodeUrl(streamUrl);
         return {
             url: appendParams(streamUrl, {
                 api_key: client.accessToken(),

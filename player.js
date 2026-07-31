@@ -3,8 +3,19 @@
 
     var MAX_SLOTS = 4;
     var PROGRESS_INTERVAL_MS = 10000;
-    var CONTROLS_IDLE_MS = 2500;
-    var CLIP_CACHE_GUARD_SECONDS = 12;
+    var DEFAULT_CONTROLS_IDLE_MS = 2500;
+    var MIN_CONTROLS_IDLE_MS = 500;
+    var MAX_CONTROLS_IDLE_MS = 30000;
+    var CLIP_CACHE_GUARD_SECONDS = 30;
+    var CLIP_CACHE_MAX_GUARD_SECONDS = 60;
+    var CLIP_READY_TIMEOUT_MS = 12000;
+    var LOOP_SEEK_TIMEOUT_MS = 5000;
+    var MSE_TARGET_BUFFER_BYTES = 48 * 1024 * 1024;
+    var DIAGNOSTIC_ENDPOINT = 'http://127.0.0.1:47831/v1/logs';
+    var DIAGNOSTIC_FLUSH_MS = 250;
+    var DIAGNOSTIC_REQUEST_TIMEOUT_MS = 3000;
+    var DIAGNOSTIC_RETRY_MS = 5000;
+    var DIAGNOSTIC_MAX_QUEUE = 1000;
     var PENDING_PREFIX = 'embyMultiWindow.pending.';
     var DEFAULT_MEDIA_CACHE_LIMIT_MB = 4096;
     var MIN_MEDIA_CACHE_LIMIT_MB = 256;
@@ -20,6 +31,272 @@
         return windowInfo.id;
     });
     var dragState = null;
+    var diagnosticSessionId = (crypto.randomUUID ?
+        crypto.randomUUID() : Date.now().toString(36) +
+        Math.random().toString(36).slice(2));
+    var diagnosticQueue = [];
+    var diagnosticFlushTimer = null;
+    var diagnosticRetryAt = 0;
+    var diagnosticFlushInFlight = false;
+    var diagnosticFetch = window.fetch.bind(window);
+
+    function diagnosticSafeUrl(value) {
+        if (!value) {
+            return '';
+        }
+        try {
+            var url = new URL(String(value), location.href);
+            [
+                'api_key',
+                'X-Emby-Token',
+                'token',
+                'auth',
+                'Authorization'
+            ].forEach(function (name) {
+                if (url.searchParams.has(name)) {
+                    url.searchParams.set(name, '[redacted]');
+                }
+            });
+            return url.href;
+        } catch (error) {
+            return String(value).replace(
+                /((?:api_key|token|auth)=)[^&\s]+/ig,
+                '$1[redacted]'
+            );
+        }
+    }
+
+    function diagnosticError(error) {
+        if (!error) {
+            return null;
+        }
+        return {
+            name: error.name || '',
+            message: error.message || String(error),
+            stack: error.stack ? String(error.stack).slice(0, 4000) : ''
+        };
+    }
+
+    function diagnosticFragment(fragment) {
+        if (!fragment) {
+            return null;
+        }
+        return {
+            sn: fragment.sn,
+            level: fragment.level,
+            type: fragment.type || '',
+            start: Number.isFinite(Number(fragment.start)) ?
+                Number(Number(fragment.start).toFixed(3)) : null,
+            duration: Number.isFinite(Number(fragment.duration)) ?
+                Number(Number(fragment.duration).toFixed(3)) : null,
+            url: diagnosticSafeUrl(fragment.url)
+        };
+    }
+
+    function diagnosticRanges(ranges) {
+        var result = [];
+        if (!ranges) {
+            return result;
+        }
+        for (var index = 0; index < ranges.length && index < 12; index += 1) {
+            try {
+                result.push([
+                    Number(ranges.start(index).toFixed(3)),
+                    Number(ranges.end(index).toFixed(3))
+                ]);
+            } catch (error) {
+                break;
+            }
+        }
+        return result;
+    }
+
+    function diagnosticSlotState(slot) {
+        var video = slot && slot.video;
+        var quality = null;
+        try {
+            quality = video && video.getVideoPlaybackQuality ?
+                video.getVideoPlaybackQuality() : null;
+        } catch (error) {}
+        var hls = slot && slot.hls;
+        var controller = hls && hls.streamController;
+        var fragment = controller && controller.fragCurrent;
+        return {
+            slotId: slot && slot.id || '',
+            itemId: slot && slot.item && slot.item.Id || '',
+            itemName: slot && slot.item &&
+                (slot.item.Name || slot.item.OriginalTitle) || '',
+            currentTime: video ? Number((video.currentTime || 0).toFixed(3)) : 0,
+            duration: video && Number.isFinite(video.duration) ?
+                Number(video.duration.toFixed(3)) : null,
+            paused: video ? !!video.paused : null,
+            seeking: video ? !!video.seeking : null,
+            readyState: video ? video.readyState : null,
+            networkState: video ? video.networkState : null,
+            buffered: diagnosticRanges(video && video.buffered),
+            seekable: diagnosticRanges(video && video.seekable),
+            videoWidth: video ? video.videoWidth : 0,
+            videoHeight: video ? video.videoHeight : 0,
+            totalFrames: quality ? quality.totalVideoFrames : null,
+            droppedFrames: quality ? quality.droppedVideoFrames : null,
+            hlsVersion: window.Hls && Hls.version || '',
+            hlsState: controller && controller.state || '',
+            hlsLoading: hls ? !!hls.loadingEnabled : null,
+            hlsBuffering: hls ? !!hls.bufferingEnabled : null,
+            fragment: diagnosticFragment(fragment),
+            cacheReady: !!(slot && slot.clipCacheReady),
+            cacheLoading: !!(slot && slot.clipCacheLoading),
+            cacheBytes: slot && slot.mediaCacheBytes || 0,
+            cacheEntries: slot && slot.mediaCache ?
+                slot.mediaCache.size : 0,
+            cacheHits: slot && slot.cacheHits || 0,
+            cacheNetworkLoads: slot && slot.cacheNetworkLoads || 0,
+            lastCacheHitAgeMs: slot && slot.lastCacheHitAt ?
+                Math.round(performance.now() - slot.lastCacheHitAt) : null,
+            activeSegment: slot && slot.activeSegment ? {
+                id: slot.activeSegment.id,
+                name: slot.activeSegment.name,
+                startMs: slot.activeSegment.startMs,
+                endMs: slot.activeSegment.endMs
+            } : null,
+            playbackPhase: slot && slot.playbackPhase || '',
+            lastHlsError: slot && slot.lastHlsError || null
+        };
+    }
+
+    function scheduleDiagnosticFlush(delay) {
+        if (diagnosticFlushTimer) {
+            return;
+        }
+        diagnosticFlushTimer = setTimeout(function () {
+            diagnosticFlushTimer = null;
+            flushDiagnosticLogs();
+        }, delay == null ? DIAGNOSTIC_FLUSH_MS : delay);
+    }
+
+    function diagnosticLog(eventName, data, level) {
+        diagnosticQueue.push({
+            timestamp: new Date().toISOString(),
+            sessionId: diagnosticSessionId,
+            page: location.href,
+            level: level || 'info',
+            event: eventName,
+            data: data || {}
+        });
+        if (diagnosticQueue.length > DIAGNOSTIC_MAX_QUEUE) {
+            diagnosticQueue.splice(
+                0,
+                diagnosticQueue.length - DIAGNOSTIC_MAX_QUEUE
+            );
+        }
+        scheduleDiagnosticFlush();
+    }
+
+    function diagnosticHlsEvent(slot, eventName, data, level) {
+        var stats = data && data.stats;
+        diagnosticLog(eventName, {
+            fragment: diagnosticFragment(data && data.frag),
+            part: data && data.part ? {
+                index: data.part.index,
+                start: data.part.start,
+                duration: data.part.duration
+            } : null,
+            details: String(data && data.details || ''),
+            type: String(data && data.type || ''),
+            parent: String(data && data.parent || ''),
+            fatal: !!(data && data.fatal),
+            reason: String(data && data.reason || ''),
+            bytes: data && data.payload && data.payload.byteLength ||
+                data && data.data && data.data.byteLength ||
+                stats && (stats.loaded || stats.total) || 0,
+            stats: stats ? {
+                loaded: stats.loaded || 0,
+                total: stats.total || 0,
+                loadingStart: stats.loading && stats.loading.start || 0,
+                loadingFirst: stats.loading && stats.loading.first || 0,
+                loadingEnd: stats.loading && stats.loading.end || 0,
+                parsingStart: stats.parsing && stats.parsing.start || 0,
+                parsingEnd: stats.parsing && stats.parsing.end || 0,
+                bufferingStart: stats.buffering && stats.buffering.start || 0,
+                bufferingEnd: stats.buffering && stats.buffering.end || 0
+            } : null,
+            error: diagnosticError(data && data.error),
+            state: diagnosticSlotState(slot)
+        }, level);
+    }
+
+    function flushDiagnosticLogs() {
+        if (!diagnosticQueue.length || diagnosticFlushInFlight) {
+            return;
+        }
+        if (Date.now() < diagnosticRetryAt) {
+            scheduleDiagnosticFlush(diagnosticRetryAt - Date.now());
+            return;
+        }
+        // Chrome limits keepalive request bodies. Keep each batch small enough
+        // to survive a window close while still preserving detailed snapshots.
+        var batch = diagnosticQueue.splice(0, 20);
+        diagnosticFlushInFlight = true;
+        var requestController = new AbortController();
+        var requestTimer = setTimeout(function () {
+            requestController.abort();
+        }, DIAGNOSTIC_REQUEST_TIMEOUT_MS);
+        diagnosticFetch(DIAGNOSTIC_ENDPOINT, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(batch),
+            cache: 'no-store',
+            credentials: 'omit',
+            keepalive: true,
+            signal: requestController.signal
+        }).then(function (response) {
+            if (!response.ok) {
+                throw new Error('diagnostic collector HTTP ' + response.status);
+            }
+            diagnosticRetryAt = 0;
+        }).catch(function () {
+            diagnosticQueue = batch.concat(diagnosticQueue).slice(
+                -DIAGNOSTIC_MAX_QUEUE
+            );
+            diagnosticRetryAt = Date.now() + DIAGNOSTIC_RETRY_MS;
+        }).finally(function () {
+            clearTimeout(requestTimer);
+            diagnosticFlushInFlight = false;
+            if (diagnosticQueue.length) {
+                scheduleDiagnosticFlush(
+                    diagnosticRetryAt ?
+                        Math.max(0, diagnosticRetryAt - Date.now()) :
+                        DIAGNOSTIC_FLUSH_MS
+                );
+            }
+        });
+    }
+
+    function flushDiagnosticLogsOnPageHide() {
+        if (!diagnosticQueue.length || !navigator.sendBeacon) {
+            flushDiagnosticLogs();
+            return;
+        }
+        while (diagnosticQueue.length) {
+            var batch = diagnosticQueue.splice(0, 20);
+            var accepted = navigator.sendBeacon(
+                DIAGNOSTIC_ENDPOINT,
+                new Blob([JSON.stringify(batch)], {type: 'text/plain;charset=UTF-8'})
+            );
+            if (!accepted) {
+                diagnosticQueue = batch.concat(diagnosticQueue).slice(
+                    -DIAGNOSTIC_MAX_QUEUE
+                );
+                break;
+            }
+        }
+    }
+    diagnosticLog('player-start', {
+        extensionVersion: chrome.runtime.getManifest ?
+            chrome.runtime.getManifest().version : '',
+        hlsVersion: window.Hls && Hls.version || '',
+        userAgent: navigator.userAgent
+    });
     var draining = false;
     var drainAgain = false;
     var controlsTimer = null;
@@ -27,6 +304,7 @@
     var settingsReadyPromise = null;
     var settings = {
         previewWidth: 280,
+        controlsIdleMs: DEFAULT_CONTROLS_IDLE_MS,
         mediaCacheMode: 'memory',
         mediaCacheLimitMb: DEFAULT_MEDIA_CACHE_LIMIT_MB
     };
@@ -35,6 +313,20 @@
         return Math.max(MIN_MEDIA_CACHE_LIMIT_MB,
             Math.min(MAX_MEDIA_CACHE_LIMIT_MB,
                 Number(value) || DEFAULT_MEDIA_CACHE_LIMIT_MB));
+    }
+
+    function clampControlsIdleMs(seconds) {
+        var milliseconds = Number(seconds) * 1000;
+        if (!Number.isFinite(milliseconds)) {
+            milliseconds = DEFAULT_CONTROLS_IDLE_MS;
+        }
+        return Math.max(
+            MIN_CONTROLS_IDLE_MS,
+            Math.min(
+                MAX_CONTROLS_IDLE_MS,
+                Math.round(milliseconds / 500) * 500
+            )
+        );
     }
 
     function showToast(message, duration) {
@@ -55,6 +347,114 @@
             ':' + String(secs).padStart(2, '0');
     }
 
+    function setPlaybackStatus(slot, phase, message) {
+        if (!slot || !slot.status) {
+            return;
+        }
+        clearTimeout(slot.statusHideTimer);
+        slot.statusHideTimer = null;
+        slot.playbackPhase = phase || '';
+        slot.status.hidden = false;
+        slot.status.textContent = message || '';
+        if (slot.status.dataset) {
+            slot.status.dataset.phase = slot.playbackPhase;
+        }
+    }
+
+    function showTransientPlaybackStatus(slot, phase, message, duration) {
+        setPlaybackStatus(slot, phase, message);
+        slot.statusHideTimer = setTimeout(function () {
+            if (slot.playbackPhase !== phase) {
+                return;
+            }
+            slot.status.hidden = true;
+            slot.playbackPhase = '';
+            if (slot.status.dataset) {
+                slot.status.dataset.phase = '';
+            }
+            slot.statusHideTimer = null;
+        }, duration || 1800);
+    }
+
+    function bufferedRangeAt(video, seconds) {
+        var ranges = video && video.buffered;
+        if (!ranges || !Number.isFinite(seconds)) {
+            return null;
+        }
+        for (var index = 0; index < ranges.length; index += 1) {
+            var start = ranges.start(index);
+            var end = ranges.end(index);
+            if (seconds >= start - 0.05 && seconds < end - 0.05) {
+                return {
+                    start: start,
+                    end: end,
+                    ahead: Math.max(0, end - seconds)
+                };
+            }
+        }
+        return null;
+    }
+
+    function clipBufferSettings(slot) {
+        var segment = slot && slot.activeSegment;
+        var duration = segment ?
+            Math.max(1, (segment.endMs - segment.startMs) / 1000) : 12;
+        var source = slot && slot.mediaSource || {};
+        var streamBitrate = (source.MediaStreams || []).reduce(function (
+            total,
+            stream
+        ) {
+            return total + (Number(stream.BitRate) || 0);
+        }, 0);
+        var bitrate = Number(source.Bitrate) || streamBitrate;
+        var durationTarget = Math.min(20, Math.max(12, duration + 3));
+        var byteTargetSeconds = bitrate > 0 ?
+            MSE_TARGET_BUFFER_BYTES * 8 / bitrate : durationTarget;
+        var forward = Math.max(6, Math.min(durationTarget, byteTargetSeconds));
+        var back = Math.max(3, Math.min(8, forward / 2));
+        return {
+            maxBufferLength: forward,
+            maxMaxBufferLength: Math.min(26, Math.max(12, forward + 6)),
+            backBufferLength: back,
+            maxBufferSize: MSE_TARGET_BUFFER_BYTES
+        };
+    }
+
+    function createHlsConfig(slot, startPositionSeconds) {
+        var hlsConfig = {
+            manifestLoadingTimeOut: 20000,
+            debug: false,
+            testBandwidth: false,
+            // Keep TS demuxing and MP4 remuxing off the playback/UI thread.
+            // The worker is packaged with the extension, so it does not
+            // depend on a blob URL or remote code.
+            enableWorker: true,
+            workerPath: chrome.runtime.getURL('hls.worker.js'),
+            loader: slot.mediaCacheEnabled ?
+                createMemoryLoaderClass(slot) : Hls.DefaultConfig.loader,
+            emeEnabled: false
+        };
+        if (Number.isFinite(Number(startPositionSeconds)) &&
+            Number(startPositionSeconds) >= 0) {
+            // Start on the selected clip instead of downloading from the
+            // beginning and then aborting that request with a second seek.
+            hlsConfig.startPosition = Number(startPositionSeconds);
+        }
+        if (slot.forceClipCache) {
+            // The raw HLS fragments stay in our ArrayBuffer cache. MSE has a
+            // separate Chrome quota, so size the decoded window by bitrate
+            // and let evicted fragments be re-appended from memory.
+            var bufferSettings = clipBufferSettings(slot);
+            hlsConfig.maxBufferLength = bufferSettings.maxBufferLength;
+            hlsConfig.maxMaxBufferLength =
+                bufferSettings.maxMaxBufferLength;
+            hlsConfig.backBufferLength =
+                bufferSettings.backBufferLength;
+            hlsConfig.maxBufferSize = bufferSettings.maxBufferSize;
+        }
+        return hlsConfig;
+    }
+
     function releaseMediaCache(slot) {
         slot.mediaCacheEnabled = false;
         if (slot.mediaCache) {
@@ -67,6 +467,14 @@
         slot.clipCacheBytes = 0;
         slot.clipCacheReady = false;
         slot.clipCacheProtectedKeys = null;
+        slot.clipCacheWindow = null;
+        slot.lastHlsError = null;
+    }
+
+    function cancelLoopSeek(slot) {
+        clearTimeout(slot.loopSeekTimer);
+        slot.loopSeekTimer = null;
+        slot.loopSeeking = false;
     }
 
     function removeMediaCacheEntry(slot, key) {
@@ -155,8 +563,10 @@
             }
             return false;
         }
+        // This is the immutable cache master. The HLS loader returns a copy
+        // because the transmuxing worker transfers and detaches its input.
         slot.mediaCache.set(key, Object.assign({
-            data: data.slice(0),
+            data: data,
             size: size
         }, metadata || {}));
         slot.mediaCacheBytes += size;
@@ -203,18 +613,32 @@
                     slot.mediaCache.set(key, cached);
                     this.cacheHit = true;
                     slot.cacheHits = (slot.cacheHits || 0) + 1;
+                    slot.lastCacheHitAt = performance.now();
+                    slot.lastCacheHitKey = key;
+                    slot.lastCacheHitBytes = cached.size;
                     var now = performance.now();
                     this.stats.loading.start = now;
                     this.stats.loading.first = now;
                     this.stats.loading.end = now;
                     this.stats.loaded = cached.size;
                     this.stats.total = cached.size;
+                    diagnosticLog('cache-hit', {
+                        state: diagnosticSlotState(slot),
+                        url: diagnosticSafeUrl(context.url),
+                        rangeStart: Number(context.rangeStart) || 0,
+                        rangeEnd: Number(context.rangeEnd) || 0,
+                        bytes: cached.size
+                    });
                     queueMicrotask(function () {
                         if (!loader.callbacks || loader.stats.aborted) {
                             return;
                         }
                         callbacks.onSuccess({
                             url: context.url,
+                            // Give every HLS.js load its own buffer. Some
+                            // demux/decode paths may retain or transfer the
+                            // supplied ArrayBuffer; reusing the cache's master
+                            // instance can leave later loops undecodable.
                             data: cached.data.slice(0),
                             code: 200
                         }, loader.stats, context, null);
@@ -230,6 +654,12 @@
                         '[Emby Multi Window] clip cache miss after encoding stop:',
                         key
                     );
+                    diagnosticLog('cache-miss-after-encoding-stop', {
+                        state: diagnosticSlotState(slot),
+                        url: diagnosticSafeUrl(context.url),
+                        rangeStart: Number(context.rangeStart) || 0,
+                        rangeEnd: Number(context.rangeEnd) || 0
+                    }, 'error');
                 }
                 var wrappedCallbacks = Object.assign({}, callbacks, {
                     onSuccess: function (response, stats, loadedContext, networkDetails) {
@@ -240,12 +670,22 @@
                             putMediaCache(
                                 slot,
                                 key,
-                                data,
+                                // HLS.js transfers response.data to its Worker.
+                                // Keep a separate, non-detached cache master.
+                                data.slice(0),
                                 fragmentMetadata(context.frag, context.url),
                                 slot.clipCacheProtectedKeys
                             );
                         }
                         slot.cacheNetworkLoads = (slot.cacheNetworkLoads || 0) + 1;
+                        diagnosticLog('cache-network-load', {
+                            state: diagnosticSlotState(slot),
+                            url: diagnosticSafeUrl(context.url),
+                            rangeStart: Number(context.rangeStart) || 0,
+                            rangeEnd: Number(context.rangeEnd) || 0,
+                            bytes: data instanceof ArrayBuffer ?
+                                data.byteLength : 0
+                        });
                         callbacks.onSuccess(response, stats, loadedContext, networkDetails);
                     }
                 });
@@ -287,10 +727,25 @@
             release: releaseMediaCache,
             put: putMediaCache,
             plan: clipFragmentPlan,
+            playbackFragment: clipPlaybackFragment,
+            planWindow: clipCacheWindow,
+            planCoversWindow: planCoversWindow,
+            createCacheStream: createClipCacheStream,
+            planStream: waitForClipFragmentPlan,
             fetchFragment: fetchClipFragment,
             cacheSegment: cacheActiveSegment,
             shouldUseHlsJs: shouldUseHlsJs,
-            cacheKey: mediaCacheKey
+            cacheKey: mediaCacheKey,
+            bufferedRangeAt: bufferedRangeAt,
+            bufferSettings: clipBufferSettings,
+            hlsConfig: createHlsConfig,
+            attachStream: attachStream,
+            waitPlaybackReady: waitForClipPlaybackReady,
+            restartLoop: restartSegmentLoop,
+            finishLoopSeek: finishSegmentLoopSeek,
+            transientStatus: showTransientPlaybackStatus,
+            diagnosticState: diagnosticSlotState,
+            diagnosticUrl: diagnosticSafeUrl
         };
     }
 
@@ -457,8 +912,12 @@
 
     function destroyMedia(slot) {
         clearInterval(slot.progressTimer);
+        clearInterval(slot.diagnosticTimer);
         clearTimeout(slot.videoDecodeTimer);
         clearTimeout(slot.waitingTimer);
+        clearTimeout(slot.statusHideTimer);
+        cancelSegmentBoundaryMonitor(slot);
+        cancelLoopSeek(slot);
         cancelClipCache(slot, false);
         if (slot.hls) {
             try {
@@ -491,9 +950,14 @@
                 !slot.video.canPlayType('application/vnd.apple.mpegurl'));
     }
 
-    function detachStream(slot, releaseCache) {
-        cancelClipCache(slot, false);
+    function detachStream(slot, releaseCache, preserveClipCache) {
+        if (!preserveClipCache) {
+            cancelClipCache(slot, false);
+        }
         clearTimeout(slot.videoDecodeTimer);
+        clearTimeout(slot.waitingTimer);
+        clearTimeout(slot.statusHideTimer);
+        cancelLoopSeek(slot);
         if (slot.hls) {
             try {
                 slot.hls.destroy();
@@ -511,17 +975,30 @@
         } catch (error) {}
     }
 
-    function switchSlotStream(slot, targetStream, reason, automaticFallback) {
+    function switchSlotStream(
+        slot,
+        targetStream,
+        reason,
+        automaticFallback,
+        startPositionMs,
+        preserveClipCache
+    ) {
         if (!targetStream || slot.stopped || streamMatches(slot.stream, targetStream)) {
             return Promise.resolve(false);
         }
-        var resumeMs = Math.max(0, (slot.video.currentTime || 0) * 1000);
+        var resumeMs = Number.isFinite(Number(startPositionMs)) ?
+            Math.max(0, Number(startPositionMs)) :
+            Math.max(0, (slot.video.currentTime || 0) * 1000);
         var wasPaused = slot.video.paused;
         slot.switchingStream = true;
         slot.fallbackStarted = !!automaticFallback;
         slot.status.hidden = false;
         slot.status.textContent = reason || '正在切换播放方式…';
-        detachStream(slot, !isHlsStream(targetStream));
+        detachStream(
+            slot,
+            !isHlsStream(targetStream),
+            !!preserveClipCache
+        );
         // Opening a pane defaults to direct play. HLS memory caching is enabled
         // only for an explicitly selected clip or a manual cache-first switch.
         slot.mediaCacheEnabled = isHlsStream(targetStream) &&
@@ -529,12 +1006,11 @@
         slot.stream = targetStream;
         slot.fallbackStream = streamMatches(targetStream, slot.directStream) ?
             slot.cacheStream : null;
-        slot.video.addEventListener('loadedmetadata', function () {
-            if (resumeMs > 0) {
-                seek(slot.video, resumeMs);
-            }
-        }, {once: true});
-        return attachStream(slot, targetStream).then(function () {
+        return attachStream(
+            slot,
+            targetStream,
+            resumeMs / 1000
+        ).then(function () {
             if (wasPaused) {
                 slot.video.pause();
             }
@@ -673,6 +1149,11 @@
             slot.clipCacheController.abort();
             slot.clipCacheController = null;
         }
+        var abandonedStream = slot.clipCacheStream;
+        slot.clipCacheStream = null;
+        if (abandonedStream && !streamMatches(slot.stream, abandonedStream)) {
+            stopActiveEncoding(slot, abandonedStream).catch(function () {});
+        }
         slot.clipCacheLoading = false;
         slot.clipCacheReady = false;
         slot.clipCacheProtectedKeys = null;
@@ -698,12 +1179,51 @@
         return level && level.details || null;
     }
 
-    function clipFragmentPlan(slot, segment) {
-        var details = currentLevelDetails(slot);
-        var startSeconds = segment.startMs / 1000;
-        var endSeconds = segment.endMs / 1000;
-        var guardStart = Math.max(0, startSeconds - CLIP_CACHE_GUARD_SECONDS);
-        var guardEnd = endSeconds + CLIP_CACHE_GUARD_SECONDS;
+    function mediaDurationSeconds(slot) {
+        var runtimeTicks = Number(slot && slot.item && slot.item.RunTimeTicks) ||
+            Number(slot && slot.mediaSource && slot.mediaSource.RunTimeTicks);
+        if (runtimeTicks > 0) {
+            return runtimeTicks / 10000000;
+        }
+        var videoDuration = Number(slot && slot.video && slot.video.duration);
+        return Number.isFinite(videoDuration) && videoDuration > 0 ?
+            videoDuration : 0;
+    }
+
+    function clipCacheWindow(slot, segment, details) {
+        var fragments = details && details.fragments || [];
+        var longestFragment = fragments.reduce(function (longest, fragment) {
+            return Math.max(longest, Number(fragment.duration) || 0);
+        }, 0);
+        // Four full HLS fragments covers keyframe lookup, audio priming and
+        // timestamp drift. Keep at least 30 seconds because some source files
+        // have unusually long GOPs or inaccurate saved segment boundaries.
+        var guard = Math.min(
+            CLIP_CACHE_MAX_GUARD_SECONDS,
+            Math.max(CLIP_CACHE_GUARD_SECONDS, longestFragment * 4)
+        );
+        var start = Math.max(0, segment.startMs / 1000 - guard);
+        var end = segment.endMs / 1000 + guard;
+        var duration = mediaDurationSeconds(slot);
+        if (duration > 0) {
+            end = Math.min(duration, end);
+        }
+        return {
+            start: start,
+            end: Math.max(start, end),
+            guardSeconds: guard
+        };
+    }
+
+    function clipFragmentPlan(
+        slot,
+        segment,
+        suppliedDetails,
+        suppliedWindow
+    ) {
+        var details = suppliedDetails || currentLevelDetails(slot);
+        var windowRange = suppliedWindow ||
+            clipCacheWindow(slot, segment, details);
         return (details && details.fragments || []).map(function (fragment) {
             var metadata = fragmentMetadata(fragment, fragment.url);
             var rangeStart = Number(fragment.byteRangeStartOffset);
@@ -724,20 +1244,29 @@
             // HLS.js may request preceding keyframe/decode data and can buffer
             // slightly beyond the loop boundary. Cache a bounded guard area so
             // those requests still hit memory after the encoding is stopped.
-            return entry.end > guardStart && entry.start < guardEnd;
+            return entry.end > windowRange.start &&
+                entry.start < windowRange.end;
         }).sort(function (first, second) {
             return first.start - second.start;
         });
     }
 
-    function planCoversSegment(plan, segment) {
+    function clipPlaybackFragment(plan, segment) {
+        var startSeconds = Math.max(0, Number(segment && segment.startMs) || 0) /
+            1000;
+        return (plan || []).find(function (entry) {
+            return entry.start <= startSeconds && entry.end > startSeconds;
+        }) || (plan || []).find(function (entry) {
+            return entry.end > startSeconds;
+        }) || null;
+    }
+
+    function planCoversWindow(plan, windowRange) {
         if (!plan.length) {
             return false;
         }
-        var startSeconds = segment.startMs / 1000;
-        var endSeconds = segment.endMs / 1000;
-        if (plan[0].start > startSeconds + 0.5 ||
-            plan[plan.length - 1].end < endSeconds - 0.5) {
+        if (plan[0].start > windowRange.start + 0.5 ||
+            plan[plan.length - 1].end < windowRange.end - 0.5) {
             return false;
         }
         return !plan.some(function (entry, index) {
@@ -745,51 +1274,227 @@
         });
     }
 
-    function waitForClipFragmentPlan(slot, segment) {
-        var immediate = clipFragmentPlan(slot, segment);
-        if (planCoversSegment(immediate, segment)) {
-            return Promise.resolve(immediate);
+    function createPlaybackSessionId() {
+        if (crypto.randomUUID) {
+            return crypto.randomUUID().replace(/-/g, '');
         }
-        if (!slot.hls) {
-            return Promise.reject(new Error('当前播放流不是可缓存的 HLS。'));
+        return Date.now().toString(36) +
+            Math.random().toString(36).slice(2) +
+            Math.random().toString(36).slice(2);
+    }
+
+    function createClipCacheStream(slot, windowRange) {
+        var template = slot.cacheStreamTemplate || slot.cacheStream;
+        if (!template || !isHlsStream(template)) {
+            return null;
         }
-        return new Promise(function (resolve, reject) {
-            var settled = false;
-            var timer = setTimeout(function () {
-                if (!settled) {
-                    settled = true;
-                    slot.hls.off(Hls.Events.LEVEL_LOADED, onLevelLoaded);
-                    reject(new Error('30 秒内没有取得覆盖完整片段的 HLS 分片清单'));
-                }
-            }, 30000);
-            function onLevelLoaded() {
-                var plan = clipFragmentPlan(slot, segment);
-                if (!settled && planCoversSegment(plan, segment)) {
-                    settled = true;
-                    clearTimeout(timer);
-                    slot.hls.off(Hls.Events.LEVEL_LOADED, onLevelLoaded);
-                    resolve(plan);
-                }
-            }
-            slot.hls.on(Hls.Events.LEVEL_LOADED, onLevelLoaded);
-            try {
-                // startLoad() does not reliably change position while HLS.js is
-                // already loading. Stop first and seek the media element so the
-                // Emby playlist is requested around the selected clip.
-                slot.hls.stopLoad();
-                seek(slot.video, segment.startMs);
-                slot.hls.startLoad(segment.startMs / 1000);
-            } catch (error) {
-                clearTimeout(timer);
-                slot.hls.off(Hls.Events.LEVEL_LOADED, onLevelLoaded);
-                reject(error);
-            }
+        var playSessionId = createPlaybackSessionId();
+        var url = new URL(template.url, location.href);
+        url.searchParams.set('PlaySessionId', playSessionId);
+        url.searchParams.set(
+            'StartTimeTicks',
+            String(Math.max(0, Math.round(windowRange.start * 10000000)))
+        );
+        return Object.assign({}, template, {
+            url: url.href,
+            playSessionId: playSessionId,
+            isHls: true,
+            cacheWindowStart: windowRange.start
         });
     }
 
-    function authenticatedFragmentUrl(slot, fragmentUrl) {
-        var parsed = new URL(fragmentUrl, slot.cacheStream.url);
-        var source = new URL(slot.cacheStream.url);
+    function playlistVariantUrl(text, baseUrl, cacheStream) {
+        var lines = String(text || '').split(/\r?\n/);
+        for (var index = 0; index < lines.length; index += 1) {
+            if (!/^#EXT-X-STREAM-INF:/i.test(lines[index].trim())) {
+                continue;
+            }
+            for (var next = index + 1; next < lines.length; next += 1) {
+                var candidate = lines[next].trim();
+                if (!candidate) {
+                    continue;
+                }
+                if (candidate.charAt(0) !== '#') {
+                    return authenticatedFragmentUrl(
+                        null,
+                        new URL(candidate, baseUrl).href,
+                        cacheStream
+                    );
+                }
+            }
+        }
+        return '';
+    }
+
+    function parseMediaPlaylist(text, playlistUrl) {
+        var lines = String(text || '').split(/\r?\n/);
+        var fragments = [];
+        var mediaSequence = 0;
+        var timeline = 0;
+        var pendingDuration = null;
+        var pendingRange = null;
+        var nextRangeStart = 0;
+        var targetDuration = 0;
+        lines.forEach(function (rawLine) {
+            var line = rawLine.trim();
+            var match;
+            if (!line) {
+                return;
+            }
+            match = /^#EXT-X-MEDIA-SEQUENCE:(\d+)/i.exec(line);
+            if (match) {
+                mediaSequence = Number(match[1]) || 0;
+                return;
+            }
+            match = /^#EXT-X-TARGETDURATION:([\d.]+)/i.exec(line);
+            if (match) {
+                targetDuration = Number(match[1]) || 0;
+                return;
+            }
+            match = /^#EXTINF:([\d.]+)/i.exec(line);
+            if (match) {
+                pendingDuration = Number(match[1]) || 0;
+                return;
+            }
+            match = /^#EXT-X-BYTERANGE:(\d+)(?:@(\d+))?/i.exec(line);
+            if (match) {
+                var length = Number(match[1]) || 0;
+                var offset = match[2] == null ?
+                    nextRangeStart : Number(match[2]) || 0;
+                pendingRange = {
+                    start: offset,
+                    end: offset + length
+                };
+                nextRangeStart = offset + length;
+                return;
+            }
+            if (line.charAt(0) === '#' || pendingDuration == null) {
+                return;
+            }
+            var duration = Math.max(0, pendingDuration);
+            fragments.push({
+                sn: mediaSequence + fragments.length,
+                start: timeline,
+                duration: duration,
+                url: new URL(line, playlistUrl).href,
+                byteRangeStartOffset: pendingRange ?
+                    pendingRange.start : 0,
+                byteRangeEndOffset: pendingRange ?
+                    pendingRange.end : 0
+            });
+            timeline += duration;
+            pendingDuration = null;
+            pendingRange = null;
+        });
+        if (!fragments.length) {
+            throw new Error('HLS 媒体清单中没有分片');
+        }
+        return {
+            fragments: fragments,
+            targetduration: targetDuration
+        };
+    }
+
+    async function fetchPlaylistText(url, cacheStream, signal) {
+        var response = await fetch(
+            authenticatedFragmentUrl(null, url, cacheStream),
+            {
+                method: 'GET',
+                cache: 'no-store',
+                credentials: 'omit',
+                signal: signal
+            }
+        );
+        if (!response.ok) {
+            throw new Error('HLS 清单 HTTP ' + response.status);
+        }
+        return response.text();
+    }
+
+    async function loadClipPlaylistDetails(slot, cacheStream, signal) {
+        var masterText = await fetchPlaylistText(
+            cacheStream.url,
+            cacheStream,
+            signal
+        );
+        var mediaUrl = cacheStream.url;
+        var mediaText = masterText;
+        if (!/#EXTINF:/i.test(masterText)) {
+            mediaUrl = playlistVariantUrl(
+                masterText,
+                cacheStream.url,
+                cacheStream
+            );
+            if (!mediaUrl) {
+                throw new Error('HLS 主清单中没有媒体清单地址');
+            }
+            mediaText = await fetchPlaylistText(
+                mediaUrl,
+                cacheStream,
+                signal
+            );
+        }
+        var details = parseMediaPlaylist(mediaText, mediaUrl);
+        diagnosticLog('clip-cache-playlist-loaded', {
+            masterUrl: diagnosticSafeUrl(cacheStream.url),
+            mediaUrl: diagnosticSafeUrl(mediaUrl),
+            fragmentCount: details.fragments.length,
+            targetDuration: details.targetduration,
+            state: diagnosticSlotState(slot)
+        });
+        return details;
+    }
+
+    async function waitForClipFragmentPlan(
+        slot,
+        segment,
+        cacheStream,
+        windowRange,
+        signal
+    ) {
+        if (typeof slot.clipCachePlanProvider === 'function') {
+            return Promise.resolve(
+                slot.clipCachePlanProvider(cacheStream, windowRange, signal)
+            ).then(function (details) {
+                var testPlan = clipFragmentPlan(
+                    slot,
+                    segment,
+                    details,
+                    windowRange
+                );
+                if (!planCoversWindow(testPlan, windowRange)) {
+                    throw new Error('测试清单没有覆盖片段保护区');
+                }
+                return {
+                    plan: testPlan,
+                    windowRange: windowRange
+                };
+            });
+        }
+        var details = await loadClipPlaylistDetails(
+            slot,
+            cacheStream,
+            signal
+        );
+        var plan = clipFragmentPlan(
+            slot,
+            segment,
+            details,
+            windowRange
+        );
+        if (!planCoversWindow(plan, windowRange)) {
+            throw new Error('HLS 清单没有覆盖片段保护区');
+        }
+        return {
+            plan: plan,
+            windowRange: windowRange
+        };
+    }
+
+    function authenticatedFragmentUrl(slot, fragmentUrl, cacheStream) {
+        cacheStream = cacheStream || slot.clipCacheStream || slot.cacheStream;
+        var parsed = new URL(fragmentUrl, cacheStream.url);
+        var source = new URL(cacheStream.url);
         ['api_key', 'DeviceId', 'MediaSourceId', 'PlaySessionId'].forEach(function (name) {
             if (!parsed.searchParams.has(name) && source.searchParams.has(name)) {
                 parsed.searchParams.set(name, source.searchParams.get(name));
@@ -812,7 +1517,13 @@
         });
     }
 
-    async function fetchClipFragment(slot, entry, protectedKeys, signal) {
+    async function fetchClipFragment(
+        slot,
+        entry,
+        protectedKeys,
+        signal,
+        cacheStream
+    ) {
         if (!slot.mediaCacheInflight) {
             slot.mediaCacheInflight = new Map();
         }
@@ -833,19 +1544,38 @@
         if (entry.rangeEnd > entry.rangeStart) {
             headers.Range = 'bytes=' + entry.rangeStart + '-' + (entry.rangeEnd - 1);
         }
+        diagnosticLog('clip-fragment-fetch-start', {
+            url: diagnosticSafeUrl(entry.url),
+            start: entry.start,
+            end: entry.end,
+            rangeStart: entry.rangeStart,
+            rangeEnd: entry.rangeEnd,
+            state: diagnosticSlotState(slot)
+        });
+        var requestStartedAt = performance.now();
         var request = (async function () {
             var response;
-            for (var attempt = 0; attempt < 7; attempt += 1) {
-                response = await fetch(authenticatedFragmentUrl(slot, entry.url), {
-                    method: 'GET',
-                    headers: headers,
-                    cache: 'no-store',
-                    credentials: 'omit',
-                    signal: signal
-                });
+            var attempt = 0;
+            for (attempt = 0; attempt < 7; attempt += 1) {
+                response = await fetch(
+                    authenticatedFragmentUrl(slot, entry.url, cacheStream),
+                    {
+                        method: 'GET',
+                        headers: headers,
+                        cache: 'no-store',
+                        credentials: 'omit',
+                        signal: signal
+                    }
+                );
                 if (response.ok) {
                     break;
                 }
+                diagnosticLog('clip-fragment-fetch-retry', {
+                    url: diagnosticSafeUrl(entry.url),
+                    status: response.status,
+                    attempt: attempt + 1,
+                    state: diagnosticSlotState(slot)
+                }, 'warn');
                 if (![404, 409, 425, 500, 503].includes(response.status) ||
                     attempt === 6) {
                     throw new Error('分片 HTTP ' + response.status);
@@ -865,6 +1595,15 @@
                     Math.round(slot.mediaCacheLimitBytes / 1024 / 1024) +
                     ' MB 内存上限');
             }
+            diagnosticLog('clip-fragment-fetch-complete', {
+                url: diagnosticSafeUrl(entry.url),
+                start: entry.start,
+                end: entry.end,
+                bytes: data.byteLength,
+                attempts: attempt + 1,
+                durationMs: Math.round(performance.now() - requestStartedAt),
+                state: diagnosticSlotState(slot)
+            });
             return data.byteLength;
         }());
         slot.mediaCacheInflight.set(entry.key, request);
@@ -877,7 +1616,14 @@
         }
     }
 
-    async function prefetchClipFragments(slot, plan, protectedKeys, controller, generation) {
+    async function prefetchClipFragments(
+        slot,
+        plan,
+        protectedKeys,
+        controller,
+        generation,
+        cacheStream
+    ) {
         var completed = 0;
         var cachedBytes = 0;
         var startedAt = performance.now();
@@ -892,7 +1638,8 @@
                 slot,
                 plan[index],
                 protectedKeys,
-                controller.signal
+                controller.signal,
+                cacheStream
             );
             cachedBytes += bytes;
             completed += 1;
@@ -917,8 +1664,210 @@
         };
     }
 
-    function stopActiveEncoding(slot) {
-        return fetch(slot.endpoints.stopEncoding, {
+    function waitForClipPlaybackReady(slot, segment) {
+        var video = slot.video;
+        var startSeconds = segment.startMs / 1000;
+        if (!video.addEventListener || !video.removeEventListener) {
+            seekExact(video, segment.startMs);
+            return Promise.resolve(video.play()).then(function () {});
+        }
+        return new Promise(function (resolve, reject) {
+            var settled = false;
+            var decodedFrame = false;
+            var playRequested = false;
+            var events = [
+                'loadedmetadata',
+                'canplay',
+                'playing',
+                'progress',
+                'seeked',
+                'timeupdate'
+            ];
+            var timer = setTimeout(function () {
+                finish(new Error(
+                    '片段起点已缓存，但 ' +
+                    Math.round(CLIP_READY_TIMEOUT_MS / 1000) +
+                    ' 秒内没有开始播放'
+                ));
+            }, CLIP_READY_TIMEOUT_MS);
+
+            function cleanup() {
+                clearTimeout(timer);
+                events.forEach(function (eventName) {
+                    video.removeEventListener(eventName, check);
+                });
+            }
+
+            function finish(error) {
+                if (settled) {
+                    return;
+                }
+                settled = true;
+                cleanup();
+                if (error) {
+                    reject(error);
+                } else {
+                    resolve();
+                }
+            }
+
+            function requestPlayback() {
+                if (playRequested || settled) {
+                    return;
+                }
+                playRequested = true;
+                diagnosticLog('clip-play-request-after-buffer', {
+                    state: diagnosticSlotState(slot)
+                });
+                var playPromise;
+                try {
+                    playPromise = video.play();
+                } catch (error) {
+                    finish(error);
+                    return;
+                }
+                if (typeof video.requestVideoFrameCallback === 'function') {
+                    video.requestVideoFrameCallback(function () {
+                        if (settled) {
+                            return;
+                        }
+                        diagnosticLog('clip-first-frame-after-buffer', {
+                            state: diagnosticSlotState(slot)
+                        });
+                        finish();
+                    });
+                }
+                Promise.resolve(playPromise).then(function () {
+                    diagnosticLog('clip-play-started-after-buffer', {
+                        state: diagnosticSlotState(slot)
+                    });
+                    finish();
+                }).catch(function (error) {
+                    if (error.name === 'NotAllowedError') {
+                        slot.status.hidden = false;
+                        slot.status.textContent = '片段已缓冲，点击画面开始播放';
+                        finish();
+                        return;
+                    }
+                    finish(error);
+                });
+            }
+
+            function check(event) {
+                if (playRequested && event && event.type === 'playing') {
+                    diagnosticLog('clip-playing-after-buffer', {
+                        state: diagnosticSlotState(slot)
+                    });
+                    finish();
+                    return;
+                }
+                var range = bufferedRangeAt(video, startSeconds);
+                var hasDecodedDimensions = video.videoWidth > 0 &&
+                    video.videoHeight > 0;
+                var hasCurrentData = video.readyState >=
+                    HTMLMediaElement.HAVE_CURRENT_DATA;
+                if (range && range.ahead >= 0.35 && !video.seeking &&
+                    (decodedFrame || hasDecodedDimensions || hasCurrentData)) {
+                    requestPlayback();
+                }
+            }
+
+            events.forEach(function (eventName) {
+                video.addEventListener(eventName, check);
+            });
+            if (typeof video.requestVideoFrameCallback === 'function') {
+                video.requestVideoFrameCallback(function () {
+                    decodedFrame = true;
+                    check();
+                });
+            }
+            seekExact(video, segment.startMs);
+            check();
+        });
+    }
+
+    function restartSegmentLoop(slot) {
+        if (!slot.activeSegment || slot.loopSeeking) {
+            return;
+        }
+        diagnosticLog('loop-seek-start', {
+            targetSeconds: slot.activeSegment.startMs / 1000,
+            state: diagnosticSlotState(slot)
+        });
+        slot.loopSeeking = true;
+        clearTimeout(slot.loopSeekTimer);
+        seekExact(slot.video, slot.activeSegment.startMs);
+        // A seek itself makes HLS.js choose the required fragment. Repeatedly
+        // stopping and restarting its controllers here races SourceBuffer
+        // updates and can leave audio and video on different append cycles.
+        slot.video.play().catch(function () {});
+        slot.loopSeekTimer = setTimeout(function () {
+            diagnosticLog('loop-seek-timeout', {
+                state: diagnosticSlotState(slot)
+            }, 'warn');
+            slot.loopSeeking = false;
+            slot.loopSeekTimer = null;
+        }, LOOP_SEEK_TIMEOUT_MS);
+    }
+
+    function cancelSegmentBoundaryMonitor(slot) {
+        if (slot && slot.segmentFrameCallbackId != null &&
+            slot.video &&
+            typeof slot.video.cancelVideoFrameCallback === 'function') {
+            try {
+                slot.video.cancelVideoFrameCallback(slot.segmentFrameCallbackId);
+            } catch (error) {}
+        }
+        if (slot) {
+            slot.segmentFrameCallbackId = null;
+        }
+    }
+
+    function startSegmentBoundaryMonitor(slot) {
+        var video = slot && slot.video;
+        if (!video ||
+            typeof video.requestVideoFrameCallback !== 'function' ||
+            slot.segmentFrameCallbackId != null) {
+            return;
+        }
+        function checkFrame(now, metadata) {
+            slot.segmentFrameCallbackId = null;
+            if (slot.stopped) {
+                return;
+            }
+            if (slot.activeSegment && !slot.loopSeeking && !video.seeking) {
+                var mediaTime = Number(metadata && metadata.mediaTime);
+                var currentMs = (
+                    Number.isFinite(mediaTime) ? mediaTime : video.currentTime
+                ) * 1000;
+                if (currentMs < slot.activeSegment.startMs - 500 ||
+                    currentMs >= slot.activeSegment.endMs) {
+                    restartSegmentLoop(slot);
+                }
+            }
+            slot.segmentFrameCallbackId =
+                video.requestVideoFrameCallback(checkFrame);
+        }
+        slot.segmentFrameCallbackId =
+            video.requestVideoFrameCallback(checkFrame);
+    }
+
+    function finishSegmentLoopSeek(slot) {
+        clearTimeout(slot.loopSeekTimer);
+        slot.loopSeekTimer = null;
+        slot.loopSeeking = false;
+        diagnosticLog('loop-seek-complete', {
+            state: diagnosticSlotState(slot)
+        });
+    }
+
+    function stopActiveEncoding(slot, stream) {
+        var url = new URL(slot.endpoints.stopEncoding, location.href);
+        var playSessionId = stream && stream.playSessionId;
+        if (playSessionId) {
+            url.searchParams.set('PlaySessionId', playSessionId);
+        }
+        return fetch(url.href, {
             method: 'POST'
         }).then(function (response) {
             if (!response.ok) {
@@ -932,92 +1881,176 @@
         if (!segment || slot.stopped) {
             return;
         }
+        diagnosticLog('clip-cache-start', {
+            segment: {
+                id: segment.id,
+                name: segment.name,
+                startMs: segment.startMs,
+                endMs: segment.endMs
+            },
+            state: diagnosticSlotState(slot)
+        });
         cancelClipCache(slot, false);
         releaseMediaCache(slot);
-        if (!slot.cacheStream || !isHlsStream(slot.cacheStream)) {
+        var cacheTemplate = slot.cacheStreamTemplate || slot.cacheStream;
+        if (!cacheTemplate || !isHlsStream(cacheTemplate)) {
             showToast('当前视频没有可用于片段缓存的 HLS 流。', 4800);
             return;
         }
-        slot.cacheStream.isHls = true;
-        slot.forceClipCache = true;
-        if (!streamMatches(slot.stream, slot.cacheStream)) {
+        cacheTemplate.isHls = true;
+        slot.forceClipCache = false;
+        if (slot.directStream && !streamMatches(slot.stream, slot.directStream)) {
             try {
                 await switchSlotStream(
                     slot,
-                    slot.cacheStream,
-                    '片段缓存需要 HLS，正在切换…',
-                    false
+                    slot.directStream,
+                    '正在恢复直连并后台缓存片段…',
+                    false,
+                    segment.startMs
                 );
             } catch (error) {
-                showToast(error.message || '无法切换到片段缓存流。', 5200);
+                showToast(error.message || '无法恢复直连播放。', 5200);
                 return;
             }
             if (slot.activeSegment !== segment || slot.stopped) {
                 return;
             }
-        } else if (!slot.hls || !slot.hlsMemoryLoaderEnabled) {
-            // The stream may already be attached through Chrome's native HLS
-            // path. Clip caching requires our HLS.js loader, so remount it.
-            detachStream(slot, false);
-            slot.mediaCacheEnabled = true;
-            slot.stream = slot.cacheStream;
-            try {
-                await attachStream(slot, slot.cacheStream);
-            } catch (error) {
-                showToast(error.message || '无法启用片段内存缓存。', 5200);
-                return;
-            }
+        } else {
+            seekExact(slot.video, segment.startMs);
+            slot.video.play().catch(function () {});
         }
-        slot.mediaCacheEnabled = true;
+        // Keep the visible pane on its current online stream. The cache uses a
+        // separate HLS PlaySessionId and starts before the guard window, so
+        // Emby only sees one forward-moving consumer for that transcode.
+        var sessionWindow = {
+            start: Math.max(
+                0,
+                segment.startMs / 1000 - CLIP_CACHE_MAX_GUARD_SECONDS
+            ),
+            end: segment.endMs / 1000 + CLIP_CACHE_MAX_GUARD_SECONDS,
+            guardSeconds: CLIP_CACHE_MAX_GUARD_SECONDS
+        };
+        var duration = mediaDurationSeconds(slot);
+        if (duration > 0) {
+            sessionWindow.end = Math.min(duration, sessionWindow.end);
+        }
+        var cacheStream = createClipCacheStream(slot, sessionWindow);
+        if (!cacheStream) {
+            showToast('无法创建独立的片段缓存会话。', 4800);
+            return;
+        }
+        slot.clipCacheStream = cacheStream;
+        slot.mediaCacheEnabled = false;
         slot.clipCacheLoading = true;
         slot.clipCacheReady = false;
         var generation = (slot.clipCacheGeneration || 0) + 1;
         slot.clipCacheGeneration = generation;
         var controller = new AbortController();
         slot.clipCacheController = controller;
-        slot.status.hidden = false;
-        slot.status.textContent = '正在准备片段播放…';
-        setSegmentCacheLabel(slot, '边播边缓存', '播放当前片段，同时缓存到内存');
-        var cacheStage = '获取 HLS 分片清单';
+        setPlaybackStatus(
+            slot,
+            'clip-cache',
+            '当前直连播放 · 正在建立独立缓存会话…'
+        );
+        setSegmentCacheLabel(
+            slot,
+            '边播边缓存',
+            '当前继续在线播放，后台使用独立会话顺序缓存'
+        );
+        var cacheStage = '建立独立 HLS 缓存会话';
         try {
-            var plan = await waitForClipFragmentPlan(slot, segment);
+            diagnosticLog('clip-cache-session-created', {
+                url: diagnosticSafeUrl(cacheStream.url),
+                sessionStart: sessionWindow.start,
+                sessionEnd: sessionWindow.end,
+                state: diagnosticSlotState(slot)
+            });
+            var planResult = await waitForClipFragmentPlan(
+                slot,
+                segment,
+                cacheStream,
+                sessionWindow,
+                controller.signal
+            );
+            var plan = planResult.plan;
+            var cachedWindow = planResult.windowRange;
+            slot.clipCacheWindow = cachedWindow;
+            diagnosticLog('clip-cache-plan', {
+                fragmentCount: plan.length,
+                windowStart: cachedWindow.start,
+                windowEnd: cachedWindow.end,
+                guardSeconds: cachedWindow.guardSeconds,
+                state: diagnosticSlotState(slot)
+            });
             if (slot.clipCacheGeneration !== generation || slot.activeSegment !== segment) {
                 return;
             }
-            seekExact(slot.video, segment.startMs);
-            await slot.video.play().catch(function (error) {
-                if (error.name !== 'NotAllowedError') {
-                    throw error;
-                }
-                slot.status.hidden = false;
-                slot.status.textContent = '点击画面开始播放；缓存会在后台继续';
-            });
             var protectedKeys = new Set(plan.map(function (entry) {
                 return entry.key;
             }));
             slot.clipCacheProtectedKeys = protectedKeys;
+            var playbackFragment = clipPlaybackFragment(plan, segment);
+            if (!playbackFragment) {
+                throw new Error('HLS 清单中没有覆盖片段起点的分片');
+            }
+            slot.status.textContent = '当前在线播放 · 正在从保护区起点顺序缓存';
             cacheStage = '下载 HLS 分片';
             var prefetchResult = await prefetchClipFragments(
                 slot,
                 plan,
                 protectedKeys,
                 controller,
-                generation
+                generation,
+                cacheStream
             );
+            diagnosticLog('clip-cache-prefetch-complete', {
+                bytes: prefetchResult.bytes,
+                durationMs: Math.round(prefetchResult.durationMs),
+                fragments: plan.length,
+                state: diagnosticSlotState(slot)
+            });
             slot.clipCacheBytes = plan.reduce(function (total, entry) {
                 var cached = slot.mediaCache.get(entry.key);
                 return total + (cached ? cached.size || 0 : 0);
             }, 0);
-            slot.clipCacheReady = plan.every(function (entry) {
+            var cacheComplete = plan.every(function (entry) {
                 return slot.mediaCache.has(entry.key);
             });
-            if (!slot.clipCacheReady) {
+            if (!cacheComplete) {
                 throw new Error('片段缓存不完整');
+            }
+            slot.clipCacheReady = false;
+            if (slot.clipCacheGeneration !== generation ||
+                slot.activeSegment !== segment) {
+                return;
+            }
+            cacheStage = '切换到内存片段';
+            slot.status.textContent = '缓存完整 · 正在切换到内存播放…';
+            slot.cacheStream = cacheStream;
+            slot.forceClipCache = true;
+            slot.mediaCacheEnabled = true;
+            if (typeof slot.clipCacheActivationProvider === 'function') {
+                await slot.clipCacheActivationProvider(cacheStream, segment);
+            } else {
+                await switchSlotStream(
+                    slot,
+                    cacheStream,
+                    '缓存完整 · 正在切换到内存播放…',
+                    false,
+                    segment.startMs,
+                    true
+                );
+                await waitForClipPlaybackReady(slot, segment);
+            }
+            slot.clipCacheReady = true;
+            if (slot.clipCacheGeneration !== generation ||
+                slot.activeSegment !== segment) {
+                return;
             }
             cacheStage = '停止服务器转码';
             var stopEncodingWarning = '';
             try {
-                await stopActiveEncoding(slot);
+                await stopActiveEncoding(slot, cacheStream);
             } catch (stopError) {
                 // The media bytes are already complete in memory. A failure of
                 // the cleanup endpoint must not discard a valid clip cache.
@@ -1033,17 +2066,27 @@
             cacheStage = '启动内存循环';
             slot.clipCacheLoading = false;
             slot.clipCacheController = null;
-            slot.status.textContent = '内存片段已就绪 · ' +
+            slot.clipCacheStream = null;
+            diagnosticLog('clip-cache-ready', {
+                bytes: slot.clipCacheBytes,
+                stopEncodingWarning: stopEncodingWarning,
+                state: diagnosticSlotState(slot)
+            });
+            showTransientPlaybackStatus(slot, 'memory-ready', '内存片段已就绪 · ' +
                 formatBytes(slot.clipCacheBytes) +
-                (stopEncodingWarning ? ' · 转码停止请求失败' : '');
+                ' · 保护 ' + Math.round(cachedWindow.guardSeconds) + ' 秒' +
+                (stopEncodingWarning ? ' · 转码停止请求失败' : ''), 1800);
             setSegmentCacheLabel(
                 slot,
                 '✓ 内存',
                 '当前片段已完整缓存到内存：' + formatBytes(slot.clipCacheBytes) +
+                    '；片段前后保护区目标 ' +
+                    Math.round(cachedWindow.guardSeconds) + ' 秒' +
                     (stopEncodingWarning ?
                         '；服务器转码停止请求失败：' + stopEncodingWarning : '')
             );
             showToast('片段已缓存到内存：' + formatBytes(slot.clipCacheBytes) +
+                ' · 保护 ' + Math.round(cachedWindow.guardSeconds) + ' 秒' +
                 ' · 平均 ' + formatBytes(
                     prefetchResult.bytes /
                     Math.max(0.001, prefetchResult.durationMs / 1000)
@@ -1058,19 +2101,38 @@
             slot.clipCacheReady = false;
             slot.clipCacheController = null;
             slot.clipCacheProtectedKeys = null;
-            try {
-                slot.hls.startLoad(segment.startMs / 1000);
-            } catch (loadError) {}
-            seek(slot.video, segment.startMs);
-            slot.video.play().catch(function () {});
+            if (cacheStream) {
+                stopActiveEncoding(slot, cacheStream).catch(function () {});
+            }
+            if (slot.directStream && streamMatches(slot.stream, cacheStream) &&
+                !slot.stopped) {
+                slot.forceClipCache = false;
+                switchSlotStream(
+                    slot,
+                    slot.directStream,
+                    '内存缓存失败 · 正在恢复直连…',
+                    false,
+                    segment.startMs,
+                    true
+                ).catch(function () {});
+            }
+            slot.clipCacheStream = null;
+            diagnosticLog('clip-cache-failed', {
+                stage: cacheStage,
+                error: diagnosticError(error),
+                state: diagnosticSlotState(slot)
+            }, 'error');
             setSegmentCacheLabel(
                 slot,
                 '⚠ 在线',
                 cacheStage + '失败：' + (error.message || error)
             );
-            slot.status.hidden = false;
-            slot.status.textContent = '片段缓存失败（' + cacheStage + '）：' +
-                (error.message || error);
+            setPlaybackStatus(
+                slot,
+                'cache-failed',
+                '片段缓存失败（' + cacheStage + '）：' +
+                    (error.message || error)
+            );
             showToast('片段缓存失败（' + cacheStage + '）：' +
                 (error.message || error), 10000);
         }
@@ -1383,18 +2445,19 @@
             slot.seekDragging = false;
         });
         video.addEventListener('loadedmetadata', function () {
-            if (slot.startPositionMs > 0) {
-                seek(video, slot.startPositionMs);
-                slot.startPositionMs = 0;
-            }
-        }, {once: true});
+            diagnosticLog('video-loadedmetadata', {
+                state: diagnosticSlotState(slot)
+            });
+        });
         video.addEventListener('timeupdate', function () {
-            if (slot.activeSegment) {
+            // requestVideoFrameCallback enforces the boundary at rendered-frame
+            // cadence. Keep timeupdate only as a fallback for older engines.
+            if (typeof video.requestVideoFrameCallback !== 'function' &&
+                slot.activeSegment && !slot.loopSeeking && !video.seeking) {
                 var currentMs = video.currentTime * 1000;
                 if (currentMs < slot.activeSegment.startMs - 500 ||
                     currentMs >= slot.activeSegment.endMs) {
-                    seekExact(video, slot.activeSegment.startMs);
-                    video.play().catch(function () {});
+                    restartSegmentLoop(slot);
                 }
             }
             time.textContent = formatTime(video.currentTime) +
@@ -1405,7 +2468,9 @@
         });
         video.addEventListener('playing', function () {
             clearTimeout(slot.waitingTimer);
-            status.hidden = true;
+            if (!slot.clipCacheLoading) {
+                status.hidden = true;
+            }
             play.textContent = '❚❚';
             play.title = '暂停';
             reportStart(slot);
@@ -1413,42 +2478,100 @@
             if (video.muted && video.volume > 0) {
                 video.muted = false;
             }
+            diagnosticLog('video-playing', {
+                state: diagnosticSlotState(slot)
+            });
         });
         video.addEventListener('waiting', function () {
+            diagnosticLog('video-waiting', {
+                state: diagnosticSlotState(slot)
+            }, 'warn');
             clearTimeout(slot.waitingTimer);
             slot.waitingTimer = setTimeout(function () {
                 if (video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA) {
                     return;
                 }
-                status.hidden = false;
-                status.textContent = slot.clipCacheReady ?
-                    '正在从内存恢复画面…' : '网络缓冲中…';
+                if (!slot.clipCacheReady) {
+                    setPlaybackStatus(slot, 'network-buffering', '网络缓冲中…');
+                    diagnosticLog('video-waiting-confirmed', {
+                        source: 'network',
+                        state: diagnosticSlotState(slot)
+                    }, 'warn');
+                    return;
+                }
+                var range = bufferedRangeAt(video, video.currentTime || 0);
+                var recentCacheHit = slot.lastCacheHitAt &&
+                    performance.now() - slot.lastCacheHitAt < 2000;
+                setPlaybackStatus(
+                    slot,
+                    range ? 'decode-waiting' : 'mse-waiting',
+                    range ?
+                        '内存数据已写入，正在等待视频解码…' :
+                        (recentCacheHit ?
+                            '已从内存读取分片，正在写入播放缓冲…' :
+                            '播放缓冲缺失，等待 HLS.js 从内存追加…')
+                );
+                diagnosticLog('video-waiting-confirmed', {
+                    source: range ? 'decoder' :
+                        (recentCacheHit ? 'mse-after-cache-hit' :
+                            'mse-before-cache-hit'),
+                    state: diagnosticSlotState(slot)
+                }, 'warn');
             }, 350);
+        });
+        video.addEventListener('stalled', function () {
+            diagnosticLog('video-stalled', {
+                state: diagnosticSlotState(slot)
+            }, 'warn');
         });
         video.addEventListener('pause', function () {
             play.textContent = '▶';
             play.title = '播放';
             reportProgress(slot, 'pause');
+            diagnosticLog('video-pause', {
+                state: diagnosticSlotState(slot)
+            });
         });
         video.addEventListener('play', function () {
             reportProgress(slot, 'unpause');
+            diagnosticLog('video-play', {
+                state: diagnosticSlotState(slot)
+            });
+        });
+        video.addEventListener('seeking', function () {
+            diagnosticLog('video-seeking', {
+                state: diagnosticSlotState(slot)
+            });
         });
         video.addEventListener('seeked', function () {
+            finishSegmentLoopSeek(slot);
             reportProgress(slot, 'seek');
+            diagnosticLog('video-seeked', {
+                state: diagnosticSlotState(slot)
+            });
         });
         video.addEventListener('volumechange', function () {
             volumeSlider.value = String(video.muted ? 0 : video.volume);
             reportProgress(slot, 'volumechange');
         });
         video.addEventListener('ended', function () {
+            diagnosticLog('video-ended', {
+                state: diagnosticSlotState(slot)
+            });
             if (slot.activeSegment) {
-                seekExact(video, slot.activeSegment.startMs);
-                video.play().catch(function () {});
+                restartSegmentLoop(slot);
             } else {
                 reportStopped(slot);
             }
         });
         video.addEventListener('error', function () {
+            diagnosticLog('video-error', {
+                mediaError: video.error ? {
+                    code: video.error.code,
+                    message: video.error.message || ''
+                } : null,
+                state: diagnosticSlotState(slot)
+            }, 'error');
             if (slot.switchingStream) {
                 return;
             }
@@ -1462,55 +2585,143 @@
                 '播放失败（媒体错误 ' + video.error.code + '）' : '视频播放失败';
         });
         populateSegments(slot);
+        startSegmentBoundaryMonitor(slot);
         return tile;
     }
 
-    function attachStream(slot, stream) {
+    function attachStream(slot, stream, startPositionSeconds) {
         stream = stream || slot.stream;
         if (shouldUseHlsJs(slot, stream)) {
             if (!window.Hls || (typeof Hls.isSupported === 'function' && !Hls.isSupported())) {
                 return Promise.reject(new Error('当前 Chrome 无法使用 HLS.js 播放此转码流。'));
             }
-            var hlsConfig = {
-                manifestLoadingTimeOut: 20000,
-                debug: false,
-                testBandwidth: false,
-                // MV3 extension pages do not allow HLS.js' blob worker under
-                // the default extension CSP. Main-thread demuxing is reliable
-                // here and each window is limited to four streams.
-                enableWorker: false,
-                loader: slot.mediaCacheEnabled ?
-                    createMemoryLoaderClass(slot) : Hls.DefaultConfig.loader,
-                emeEnabled: false
-            };
-            if (slot.forceClipCache) {
-                // Limit forward prefetch to the cached guard area, but let the
-                // browser retain old MSE data for as long as its own quota
-                // permits so short clips can loop without being re-appended.
-                hlsConfig.maxBufferLength = 6;
-                hlsConfig.maxMaxBufferLength = 12;
-                hlsConfig.backBufferLength = Infinity;
-            }
+            var hlsConfig = createHlsConfig(slot, startPositionSeconds);
             var hls = new Hls(hlsConfig);
             slot.hls = hls;
             slot.hlsMemoryLoaderEnabled = slot.mediaCacheEnabled;
+            diagnosticLog('hls-attach', {
+                url: diagnosticSafeUrl(stream.url),
+                memoryLoader: slot.hlsMemoryLoaderEnabled,
+                forceClipCache: !!slot.forceClipCache,
+                config: {
+                    enableWorker: hlsConfig.enableWorker,
+                    workerPath: diagnosticSafeUrl(hlsConfig.workerPath),
+                    maxBufferLength: hlsConfig.maxBufferLength,
+                    maxMaxBufferLength: hlsConfig.maxMaxBufferLength,
+                    backBufferLength: hlsConfig.backBufferLength,
+                    maxBufferSize: hlsConfig.maxBufferSize,
+                    startPosition: hlsConfig.startPosition
+                },
+                state: diagnosticSlotState(slot)
+            });
             return new Promise(function (resolve, reject) {
                 var settled = false;
-                hls.on(Hls.Events.MANIFEST_PARSED, function () {
+                hls.on(Hls.Events.MANIFEST_PARSED, function (event, data) {
+                    diagnosticLog('hls-manifest-parsed', {
+                        levels: data && data.levels ? data.levels.length : 0,
+                        audioTracks: data && data.audioTracks ?
+                            data.audioTracks.length : 0,
+                        state: diagnosticSlotState(slot)
+                    });
                     if (settled) {
                         return;
                     }
                     settled = true;
-                    slot.video.play().then(resolve).catch(function (error) {
+                    // Manifest attachment is complete. Do not make callers wait
+                    // for play() to resolve; that promise can remain pending
+                    // until HLS has buffered the selected time position.
+                    resolve();
+                    if (slot.forceClipCache) {
+                        diagnosticLog('hls-play-deferred-for-clip-cache', {
+                            startPosition: hlsConfig.startPosition,
+                            state: diagnosticSlotState(slot)
+                        });
+                        return;
+                    }
+                    var playPromise;
+                    try {
+                        playPromise = slot.video.play();
+                    } catch (error) {
+                        diagnosticLog('hls-play-request-failed', {
+                            error: diagnosticError(error),
+                            state: diagnosticSlotState(slot)
+                        }, 'warn');
+                        return;
+                    }
+                    Promise.resolve(playPromise).catch(function (error) {
                         if (error.name === 'NotAllowedError') {
                             slot.status.textContent = '点击画面开始播放';
-                            resolve();
                         } else {
-                            reject(error);
+                            diagnosticLog('hls-play-request-failed', {
+                                error: diagnosticError(error),
+                                state: diagnosticSlotState(slot)
+                            }, 'warn');
                         }
                     });
                 });
-            hls.on(Hls.Events.ERROR, function (event, data) {
+                if (Hls.Events.LEVEL_LOADED) {
+                    hls.on(Hls.Events.LEVEL_LOADED, function (event, data) {
+                        var details = data && data.details;
+                        var fragments = details && details.fragments || [];
+                        diagnosticLog('hls-level-loaded', {
+                            level: data && data.level,
+                            fragmentCount: fragments.length,
+                            start: fragments.length ? fragments[0].start : null,
+                            end: fragments.length ?
+                                fragments[fragments.length - 1].start +
+                                fragments[fragments.length - 1].duration : null,
+                            targetDuration: details && details.targetduration,
+                            state: diagnosticSlotState(slot)
+                        });
+                    });
+                }
+                [
+                    ['FRAG_LOADING', 'hls-frag-loading'],
+                    ['FRAG_LOADED', 'hls-frag-loaded'],
+                    ['FRAG_BUFFERED', 'hls-frag-buffered'],
+                    ['BUFFER_APPENDING', 'hls-buffer-appending'],
+                    ['BUFFER_APPENDED', 'hls-buffer-appended']
+                ].forEach(function (entry) {
+                    var eventName = Hls.Events[entry[0]];
+                    if (eventName) {
+                        hls.on(eventName, function (event, data) {
+                            diagnosticHlsEvent(slot, entry[1], data);
+                        });
+                    }
+                });
+                hls.on(Hls.Events.ERROR, function (event, data) {
+                    var details = String(data && data.details || '');
+                    var type = String(data && data.type || '');
+                    var expectedClipAbort = details === 'aborted' &&
+                        slot.clipCacheLoading && !(data && data.fatal);
+                    if (expectedClipAbort) {
+                        diagnosticHlsEvent(
+                            slot,
+                            'hls-load-aborted-for-clip-cache',
+                            data,
+                            'info'
+                        );
+                        return;
+                    }
+                    slot.lastHlsError = {
+                        at: Date.now(),
+                        details: details,
+                        type: type,
+                        fatal: !!(data && data.fatal)
+                    };
+                    diagnosticHlsEvent(
+                        slot,
+                        'hls-error',
+                        data,
+                        data && data.fatal ? 'error' : 'warn'
+                    );
+                    if (slot.clipCacheReady && !(data && data.fatal) &&
+                        /buffer.*(?:stall|full)|stall.*buffer/i.test(details)) {
+                        console.warn(
+                            '[Emby Multi Window] cached clip HLS buffer warning:',
+                            slot.lastHlsError
+                        );
+                    }
                     if (data && data.fatal) {
                         var error = new Error('HLS 播放失败：' +
                             (data.details || data.type || '未知错误'));
@@ -1518,8 +2729,7 @@
                             settled = true;
                             reject(error);
                         } else {
-                            slot.status.hidden = false;
-                            slot.status.textContent = error.message;
+                            setPlaybackStatus(slot, 'hls-fatal', error.message);
                         }
                     }
                 });
@@ -1527,14 +2737,72 @@
                 hls.attachMedia(slot.video);
             });
         }
+        diagnosticLog('native-stream-attach', {
+            url: diagnosticSafeUrl(stream.url),
+            startPosition: Number.isFinite(Number(startPositionSeconds)) ?
+                Number(startPositionSeconds) : 0,
+            state: diagnosticSlotState(slot)
+        });
         slot.video.src = stream.url;
-        return slot.video.play().catch(function (error) {
-            if (error.name === 'NotAllowedError') {
-                slot.status.textContent = '点击画面开始播放';
+        var startSeconds = Number.isFinite(Number(startPositionSeconds)) ?
+            Math.max(0, Number(startPositionSeconds)) : 0;
+        var started = false;
+
+        function requestPlay() {
+            var playPromise;
+            try {
+                playPromise = slot.video.play();
+            } catch (error) {
+                diagnosticLog('native-play-request-failed', {
+                    error: diagnosticError(error),
+                    state: diagnosticSlotState(slot)
+                }, 'error');
+                slot.status.hidden = false;
+                slot.status.textContent = error.message || '视频播放失败';
                 return;
             }
-            throw error;
-        });
+            Promise.resolve(playPromise).catch(function (error) {
+                if (error.name === 'NotAllowedError') {
+                    slot.status.textContent = '点击画面开始播放';
+                    return;
+                }
+                diagnosticLog('native-play-request-failed', {
+                    error: diagnosticError(error),
+                    state: diagnosticSlotState(slot)
+                }, 'error');
+            });
+        }
+
+        function startAfterMetadata() {
+            if (started) {
+                return;
+            }
+            started = true;
+            if (startSeconds > 0) {
+                seekExact(slot.video, startSeconds * 1000);
+                if (slot.video.seeking) {
+                    slot.video.addEventListener('seeked', requestPlay, {
+                        once: true
+                    });
+                    return;
+                }
+            }
+            requestPlay();
+        }
+
+        // Starting playback before metadata and the initial seek lets the
+        // audio clock run at the old position while video decoding is being
+        // relocated. Mount first, seek once, and only then start both tracks.
+        if (slot.video.readyState >= HTMLMediaElement.HAVE_METADATA) {
+            startAfterMetadata();
+        } else {
+            slot.video.addEventListener(
+                'loadedmetadata',
+                startAfterMetadata,
+                {once: true}
+            );
+        }
+        return Promise.resolve();
     }
 
     function addPayload(payload) {
@@ -1562,6 +2830,7 @@
             stream: selectedStream,
             directStream: directStream,
             cacheStream: cacheStream,
+            cacheStreamTemplate: cacheStream,
             fallbackStream: streamMatches(selectedStream, directStream) ?
                 cacheStream : null,
             startPositionMs: Math.max(0, Number(payload.startPositionTicks) || 0) / 10000,
@@ -1587,24 +2856,58 @@
             clipCacheReady: false,
             clipCacheGeneration: 0,
             clipCacheController: null,
+            clipCacheStream: null,
             clipCacheProtectedKeys: null,
+            clipCacheWindow: null,
+            segmentFrameCallbackId: null,
+            lastHlsError: null,
+            loopSeeking: false,
+            loopSeekTimer: null,
             forceClipCache: false,
             mediaCacheEnabled: false,
             mediaCacheLimitBytes: clampMediaCacheLimit(
                 settings.mediaCacheLimitMb
             ) * 1024 * 1024,
-            progressTimer: null
+            statusHideTimer: null,
+            progressTimer: null,
+            diagnosticTimer: null
+        });
+        diagnosticLog('slot-added', {
+            stream: {
+                url: diagnosticSafeUrl(selectedStream && selectedStream.url),
+                isHls: isHlsStream(selectedStream),
+                directAvailable: !!directStream,
+                cacheAvailable: !!cacheStream
+            },
+            state: diagnosticSlotState(slot)
         });
         slots.set(slot.id, slot);
         grid.appendChild(createTile(slot));
         updateGrid();
-        return Promise.all([attachStream(slot, slot.stream), loadSegments(slot), loadThumbnails(slot)])
+        var initialStartSeconds = slot.startPositionMs / 1000;
+        slot.startPositionMs = 0;
+        return Promise.all([
+            attachStream(slot, slot.stream, initialStartSeconds),
+            loadSegments(slot),
+            loadThumbnails(slot)
+        ])
             .then(function () {
                 slot.progressTimer = setInterval(function () {
                     reportProgress(slot, 'timeupdate');
                 }, PROGRESS_INTERVAL_MS);
+                slot.diagnosticTimer = setInterval(function () {
+                    if (slot.activeSegment && !slot.stopped) {
+                        diagnosticLog('playback-snapshot', {
+                            state: diagnosticSlotState(slot)
+                        });
+                    }
+                }, 2000);
                 showToast('已加入：' + displayName(slot.item));
             }).catch(function (error) {
+                diagnosticLog('slot-add-failed', {
+                    error: diagnosticError(error),
+                    state: diagnosticSlotState(slot)
+                }, 'error');
                 removeSlot(slot.id);
                 throw error;
             });
@@ -1664,7 +2967,7 @@
             slots.forEach(function (slot) {
                 slot.preview.hidden = true;
             });
-        }, CONTROLS_IDLE_MS);
+        }, settings.controlsIdleMs);
     }
 
     chrome.runtime.onMessage.addListener(function (message) {
@@ -1684,6 +2987,12 @@
                 '--preview-width',
                 settings.previewWidth + 'px'
             );
+        }
+        if (area === 'sync' && changes.controlsIdleSeconds) {
+            settings.controlsIdleMs = clampControlsIdleMs(
+                changes.controlsIdleSeconds.newValue
+            );
+            revealControls();
         }
         if (area === 'sync' && changes.mediaCacheMode) {
             settings.mediaCacheMode = changes.mediaCacheMode.newValue === 'off' ?
@@ -1743,6 +3052,26 @@
             newWindowButton.disabled = false;
         });
     });
+    window.addEventListener('error', function (event) {
+        diagnosticLog('window-error', {
+            message: event.message || '',
+            filename: diagnosticSafeUrl(event.filename),
+            line: event.lineno || 0,
+            column: event.colno || 0,
+            error: diagnosticError(event.error)
+        }, 'error');
+    });
+    window.addEventListener('unhandledrejection', function (event) {
+        diagnosticLog('unhandled-rejection', {
+            error: diagnosticError(event.reason)
+        }, 'error');
+    });
+    window.addEventListener('pagehide', function () {
+        diagnosticLog('player-pagehide', {
+            slots: Array.from(slots.values()).map(diagnosticSlotState)
+        });
+        flushDiagnosticLogsOnPageHide();
+    });
     window.addEventListener('beforeunload', function () {
         slots.forEach(function (slot) {
             reportStopped(slot, true);
@@ -1752,6 +3081,7 @@
 
     settingsReadyPromise = chrome.storage.sync.get({
         previewWidth: 280,
+        controlsIdleSeconds: DEFAULT_CONTROLS_IDLE_MS / 1000,
         mediaCacheMode: 'memory',
         mediaCacheLimitMb: DEFAULT_MEDIA_CACHE_LIMIT_MB,
         mediaCacheLimitVersion: 0
@@ -1775,6 +3105,9 @@
         document.documentElement.style.setProperty(
             '--preview-width',
             settings.previewWidth + 'px'
+        );
+        settings.controlsIdleMs = clampControlsIdleMs(
+            stored.controlsIdleSeconds
         );
         settings.mediaCacheMode = stored.mediaCacheMode === 'off' ?
             'off' : 'memory';
