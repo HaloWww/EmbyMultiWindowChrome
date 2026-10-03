@@ -43,7 +43,7 @@ Chrome Manifest V3 扩展。它把多个 Emby 播放会话放入一个普通的�
 
 ### 下载版
 
-1. 下载 [`dist/EmbyMultiWindowChrome-0.7.24.zip`](dist/EmbyMultiWindowChrome-0.7.24.zip)。
+1. 下载 [`dist/EmbyMultiWindowChrome-0.7.28.zip`](dist/EmbyMultiWindowChrome-0.7.28.zip)。
 2. 解压到一个固定目录。
 3. 打开 `chrome://extensions/`。
 4. 开启“开发者模式”。
@@ -56,7 +56,7 @@ Chrome Manifest V3 扩展。它把多个 Emby 播放会话放入一个普通的�
 3. 点击“加载已解压的扩展程序”。
 4. 选择仓库根目录 `EmbyMultiWindowChrome`。
 
-默认启用 `localhost` 和 `127.0.0.1`。局域网 IP、端口或域名可以直接在扩展
+默认启用 `localhost`、`127.0.0.1` 和 `http://192.168.8.10:8096`。其他局域网 IP、端口或域名可以直接在扩展
 设置页的“适配的网址”中添加，不需要修改 `manifest.json`。省略端口表示允许
 该主机的任意端口；也支持 `https://*.example.com` 形式的子域名通配。
 
@@ -70,6 +70,15 @@ Chrome Manifest V3 扩展。它把多个 Emby 播放会话放入一个普通的�
 - `hls.js` / `hls.worker.js`：HLS.js 1.7.0-beta.2 播放器和独立转封装 Worker
 
 ## 媒体缓存
+
+0.7.25 修复了缓存就绪后未命中分片仍请求旧转码会话的问题。现在先固定一个媒体
+清单，缓存分片及初始化段/AES-128 密钥等依赖，再生成仅包含缓存范围的本地 VOD
+清单。HLS.js 从内存加载清单和分片，并保留原视频时间偏移；不再刷新服务器清单
+或选择未缓存的变体。离线资源缺失时会恢复直连或建立新的在线 HLS 会话。关闭
+缓存、退出片段、降低容量上限时也不会继续使用已经停止的会话。
+
+使用独立音轨、SAMPLE-AES/DRM 或部分高级 HLS 标签的清单暂不进入离线缓存，
+会明确提示并保留在线播放。后台窗口缺少逐帧回调时，也会通过进度事件检查循环边界。
 
 普通播放不会写入扩展缓存。设置页可以启用或关闭循环片段的 HLS 内存缓存，
 并设置 256 MB–16 GB 的单路
@@ -90,6 +99,61 @@ LRU 淘汰。选择
 
 直连 MP4 由 `<video>` 直接发起 Range 请求，其缓存由 Chrome 和 Emby 的
 HTTP 缓存头控制，扩展无法像 HLS/MSE 一样可靠接管或强制释放。
+
+## 油猴脚本（实验版）
+
+0.7.28 精简播放器：保留每路影片标题，去掉窗口外侧留白和圆角边框，显示视频与按需出现的
+播放控件；新建窗口改为 `＋` 图标。右上角 `⛶`、双击视频或按 `F` 可切换整个
+多画面窗口的全屏，`Esc` 退出。全屏时浏览器导航界面隐藏；普通浮窗的原生
+地址栏、系统标题栏由浏览器控制，油猴脚本不能强制删除。
+
+单文件发行版：[`dist/EmbyMultiWindow.user.js`](dist/EmbyMultiWindow.user.js)。
+使用同一份播放器代码，内嵌固定版本 HLS.js、Worker、样式和设置页，不依赖 CDN。
+影片标题随控件显示和隐藏，窗口标题保持简洁；鼠标移回视频即可查看影片名称。
+
+Greasy Fork 发布版：[安装页面](https://greasyfork.org/zh-CN/scripts/598505-emby-multi-window)，
+源文件：[`dist/EmbyMultiWindow.greasyfork.user.js`](dist/EmbyMultiWindow.greasyfork.user.js)。
+播放器代码保持可读，HLS.js 和 Worker 通过 jsDelivr 的固定版本及 SHA-256 哈希
+加载，符合 Greasy Fork 对外部库的要求。默认匹配 Emby 标准 `/web/` 路径；
+使用自定义路径时，请在油猴的用户设置中增加该 Emby 网址的匹配规则。
+Github 单文件版通过脚本管理器检查 GitHub 上的更新，Greasy Fork 版通过站点更新。
+
+1. 在 Tampermonkey 管理面板选择“添加新脚本”，粘贴该文件的全部内容并保存。
+2. 使用油猴版时停用同名 Chrome 扩展，避免两套入口同时发送视频。
+3. 打开 Emby 网站，从油猴菜单点击“启用此 Emby 网站”；页面会刷新。
+4. 如需设置，从油猴菜单打开“Emby 多画面：设置”。
+5. 点击“加入更多画面”，允许该网站打开弹窗。Shift 点击可新建窗口。
+
+0.7.26 修复了 HTTP 局域网地址在 `document-start` 缺少 `crypto.randomUUID()`
+导致油猴版启动中断的问题，改用 `crypto.getRandomValues()` 生成随机标识。
+`http://192.168.8.10:8096` 已加入默认适配列表；已有自定义列表继续保留。
+从设置页添加适配网址后，已打开的标签也会激活入口。详情页入口会补扫已经
+加载的页面，并在切换视频和恢复页面时更新，避免错过一次性的 `itemshow` 事件。
+升级时请替换原脚本内容、保存，再刷新 Emby 页面；首页没有加入按钮，视频
+详情页的播放按钮旁显示“加入更多画面”，正在播放时右下角显示“加入多画面”。
+
+保留四画面、独立声音、片段循环、缩略图、排序、多窗口和内存缓存。每个播放器
+窗口独立运行，关闭原 Emby 标签不会释放播放器的缓存。设置通过 GM 存储在
+本地保存，不承诺 Chrome 账号同步。GM 网络适配支持不同服务器的媒体加入同一
+播放器，但普通视频直连仍由浏览器发起，不能由 GM 请求强制代理。
+
+此脚本匹配 HTTP/HTTPS 页面，但只有配置的网站加载 Emby 入口。`@connect *`
+用于访问用户配置的服务器和重定向地址；油猴可能要求批准实际请求的域名。
+弹窗外观、焦点及 Worker 的 CSP 限制由浏览器决定，Worker 创建失败时 HLS.js
+会尝试在主线程处理。
+
+已在真实 Chromium 中使用模拟 GM 接口验证播放，并验证窗口复用和跨标签队列。
+已用模拟 GM 接口在 `http://192.168.8.10:8096` 的 Emby 4.9.5.0 页面验证启动。
+真实 Tampermonkey 沙箱及登录后的实际媒体播放仍需现场试用。
+
+构建命令：`node tools/build-userscript.cjs`。
+Greasy Fork 版：`node tools/build-userscript.cjs --greasyfork`。
+回归测试：`node tests/cache-offline.cjs`、`node tests/userscript-runtime.cjs`、
+`node tests/background-smoke.js`。真实音视频测试：`node tests/offline-loop.cjs`，
+需要 Node.js、Playwright 和 FFmpeg。可用 `EMBY_TEST_BROWSER` 指定浏览器，
+`EMBY_TEST_FFMPEG` 指定 FFmpeg，`EMBY_TEST_FIXTURE` 复用测试媒体。
+入口回归：`node tests/entry-startup.cjs`（需要 Playwright）；可用
+`EMBY_TEST_LIVE_URL` 指定实际服务器页面，仅检查启动，不读取登录凭据。
 
 ## 本机诊断日志
 

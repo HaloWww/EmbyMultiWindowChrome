@@ -6,7 +6,7 @@
     }
     window.__embyMultiWindowLoaded = true;
 
-    var VERSION = '0.7.24';
+    var VERSION = '0.7.28';
     var READY_RETRY_MS = 700;
     var MODULE_ROOT = './modules/';
     var SEGMENT_STORAGE_KEY = 'embySegmentLoop.v1';
@@ -16,6 +16,7 @@
     var readyAttempts = 0;
     var launcherTimer = null;
     var launcherObserver = null;
+    var detailRequests = new WeakMap();
     var playbackManagerPromise = null;
     var apiClientClassPromise = null;
     var profileBuilderPromise = null;
@@ -491,12 +492,21 @@
     }
 
     function queueContext(contextPromise, trigger, openInNewWindow) {
+        var preparedWindow = null;
+        try {
+            preparedWindow = window.__embyMultiWindowPrepareWindow ?
+                window.__embyMultiWindowPrepareWindow(!!openInNewWindow) : null;
+        } catch (error) {
+            showToast(error.message || '无法打开多画面窗口。', 4800);
+            return;
+        }
         if (trigger) {
             trigger.disabled = true;
         }
         Promise.resolve(contextPromise).then(function (context) {
             return preparePayload(context).then(function (payload) {
                 payload.openInNewWindow = !!openInNewWindow;
+                if (preparedWindow) { payload.targetPlayerId = preparedWindow; }
                 pending.set(payload.requestId, {context: context, trigger: trigger});
                 window.postMessage({
                     source: 'emby-multiwindow-page',
@@ -582,7 +592,49 @@
         var item = event.detail && event.detail.item;
         var view = event.target && event.target.closest ?
             event.target.closest('.itemView') : null;
-        renderDetailButton(view || event.target, item);
+        view = view || event.target;
+        if (view && item) { view.embyMultiWindowItem = item; }
+        renderDetailButton(view, item);
+    }
+
+    function routeItemId() {
+        var match = location.href.match(/[?&#](?:id|itemid)=([^&#]+)/i);
+        try { return match ? decodeURIComponent(match[1]) : null; }
+        catch (_) { return null; }
+    }
+
+    function scanDetailButtons() {
+        document.querySelectorAll('.mainDetailButtons').forEach(function (host) {
+            if (!host.isConnected || !host.getClientRects().length) { return; }
+            var view = host.closest('.itemView') || host.parentElement;
+            if (!view) { return; }
+            var itemId = routeItemId() || view.getAttribute('data-itemid');
+            var item = view.embyMultiWindowItem;
+            if (item && (!itemId || String(item.Id) === String(itemId))) {
+                renderDetailButton(view, item);
+                return;
+            }
+            var button = host.querySelector('.emby-multiwindow-detail-button');
+            if (button && itemId && String(button.embyMultiWindowItem.Id) !== String(itemId)) { button.remove(); }
+            var client = window.ApiClient;
+            if (!itemId || !client || typeof client.getItem !== 'function' ||
+                typeof client.getCurrentUserId !== 'function' || !client.getCurrentUserId()) { return; }
+            var previous = detailRequests.get(host);
+            if (previous && previous.id === itemId && (previous.pending || Date.now() - previous.time < 5000)) { return; }
+            var request = {id: itemId, pending: true, time: Date.now()};
+            var route = location.href;
+            detailRequests.set(host, request);
+            Promise.resolve().then(function () {
+                return client.getItem(client.getCurrentUserId(), itemId);
+            }).then(function (loaded) {
+                if (detailRequests.get(host) !== request || !host.isConnected ||
+                    !host.getClientRects().length || location.href !== route) { return; }
+                view.embyMultiWindowItem = loaded;
+                renderDetailButton(view, loaded);
+            }).catch(function (error) {
+                warn('读取详情页视频失败。', error);
+            }).finally(function () { request.pending = false; request.time = Date.now(); });
+        });
     }
 
     function hasVisiblePlaybackVideo() {
@@ -596,6 +648,7 @@
         if (launcher) {
             launcher.hidden = !hasVisiblePlaybackVideo();
         }
+        scanDetailButtons();
     }
 
     function scheduleLauncherUpdate() {
@@ -619,7 +672,7 @@
     }
 
     function initializeWhenReady() {
-        if (window.Emby && typeof window.Emby.importModule === 'function' &&
+        if (document.body && window.Emby && typeof window.Emby.importModule === 'function' &&
             window.ApiClient && typeof window.ApiClient.getPlaybackInfo === 'function') {
             createLauncher();
             document.addEventListener('itemshow', onItemShow);
@@ -631,13 +684,12 @@
                 attributeFilter: ['class', 'src']
             });
             window.addEventListener('hashchange', scheduleLauncherUpdate);
+            setInterval(updateLauncherVisibility, 2000);
             log('Extension initialized.');
             return;
         }
         readyAttempts += 1;
-        if (readyAttempts < 90) {
-            setTimeout(initializeWhenReady, READY_RETRY_MS);
-        }
+        setTimeout(initializeWhenReady, readyAttempts < 90 ? READY_RETRY_MS : 3000);
     }
 
     if (window.__embyMultiWindowTestMode) {

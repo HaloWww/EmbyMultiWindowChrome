@@ -30,7 +30,8 @@
         'http://localhost',
         'https://localhost',
         'http://127.0.0.1',
-        'https://127.0.0.1'
+        'https://127.0.0.1',
+        'http://192.168.8.10:8096'
     ];
 
     function clampWidth(value) {

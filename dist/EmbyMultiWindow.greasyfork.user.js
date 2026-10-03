@@ -1,3 +1,77 @@
+// ==UserScript==
+// @name         Emby Multi Window
+// @name:zh-CN   Emby 多画面播放器
+// @namespace    https://github.com/HaloWww/EmbyMultiWindowChrome
+// @version      0.7.28
+// @author       HaloWww (westmelon)
+// @license      All Rights Reserved
+// @description  Emby 四画面播放、片段离线内存循环和独立播放窗口
+// @match        http://*/web/*
+// @match        https://*/web/*
+// @run-at       document-start
+// @noframes
+// @sandbox      JavaScript
+// @grant        unsafeWindow
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @grant        GM_listValues
+// @grant        GM_addValueChangeListener
+// @grant        GM_xmlhttpRequest
+// @grant        GM_registerMenuCommand
+// @grant        GM_addStyle
+// @grant        GM_getResourceText
+// @connect      *
+// @homepageURL  https://github.com/HaloWww/EmbyMultiWindowChrome
+// @require      https://cdn.jsdelivr.net/npm/hls.js@1.7.0-beta.2/dist/hls.min.js#sha256=EVhWL1k+LlZQuzgsf7rlEJDObvfecvdAZxS3uoMdvbE=
+// @resource     embyHlsWorker https://cdn.jsdelivr.net/npm/hls.js@1.7.0-beta.2/dist/hls.worker.js#sha256=7d3qaLAflJL3WzNZnO87FSLoamaZQeCfgsN5tUZg56Q=
+// ==/UserScript==
+
+(function () {
+'use strict';
+/* Bundled HLS.js license:
+Copyright (c) 2017 Dailymotion (http://www.dailymotion.com)
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+
+src/remux/mp4-generator.js and src/demux/exp-golomb.ts implementation in this project
+are derived from the HLS library for video.js (https://github.com/videojs/videojs-contrib-hls)
+
+That work is also covered by the Apache 2 License, following copyright:
+Copyright (c) 2013-2015 Brightcove
+
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+
+*/
+const window = unsafeWindow;
+const document = window.document;
+const location = window.location;
+const fetch = gmFetch;
+const WORKER_SOURCE = GM_getResourceText('embyHlsWorker');
+const PLAYER_HTML = "<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n    <meta charset=\"utf-8\">\n    <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n    <title>&#8203;</title>\n    <link rel=\"stylesheet\" href=\"player.css\">\n</head>\n<body>\n    <main id=\"stage\" aria-live=\"polite\">\n        <div id=\"grid\"></div>\n        <div id=\"windowTools\">\n            <button id=\"newWindow\" type=\"button\" title=\"新建一个独立的多画面窗口\" aria-label=\"新建窗口\">\n                <span aria-hidden=\"true\">＋</span>\n            </button>\n            <button id=\"fullscreen\" type=\"button\" title=\"全屏（F / 双击画面）\" aria-label=\"全屏\" aria-pressed=\"false\">⛶</button>\n        </div>\n        <div id=\"empty\">\n            <div class=\"empty-icon\">▦</div>\n            <div>在 Emby 视频详情页或播放页点击“加入更多画面”</div>\n        </div>\n        <div id=\"toast\" role=\"status\"></div>\n    </main>\n    <script src=\"hls.js\"></script>\n    <script src=\"player.js\"></script>\n</body>\n</html>\n";
+const PLAYER_CSS = ":root {\n    color-scheme: dark;\n    --preview-width: 280px;\n    background: #080808;\n}\n\n* {\n    box-sizing: border-box;\n}\n\nhtml,\nbody,\n#stage {\n    width: 100%;\n    height: 100%;\n    margin: 0;\n    overflow: hidden;\n}\n\nbody {\n    color: #fff;\n    background: #080808;\n    font-family: system-ui, -apple-system, \"Segoe UI\", sans-serif;\n}\n\n#stage {\n    position: relative;\n}\n\n#stage.controls-hidden {\n    cursor: none;\n}\n\n#grid {\n    display: grid;\n    width: 100%;\n    height: 100%;\n    gap: 1px;\n    padding: 0;\n}\n\n#windowTools {\n    position: fixed;\n    top: 7px;\n    right: 43px;\n    z-index: 12;\n    display: flex;\n    align-items: center;\n    gap: 6px;\n    transition: opacity .18s ease;\n}\n\n#windowTools button {\n    display: inline-flex;\n    width: 30px;\n    height: 30px;\n    align-items: center;\n    justify-content: center;\n    gap: 5px;\n    padding: 0;\n    border: 1px solid rgba(255, 255, 255, .2);\n    border-radius: 999px;\n    color: rgba(255, 255, 255, .9);\n    background: rgba(12, 12, 12, .78);\n    box-shadow: 0 3px 12px rgba(0, 0, 0, .28);\n    font: 18px/1 system-ui, sans-serif;\n    backdrop-filter: blur(7px);\n    cursor: pointer;\n}\n\n#windowTools button:hover {\n    border-color: rgba(117, 204, 111, .72);\n    background: rgba(24, 24, 24, .94);\n}\n\n#windowTools button:disabled {\n    opacity: .55;\n    cursor: wait;\n}\n\n#windowTools button[hidden] { display: none; }\n\n#stage:fullscreen { background: #000; }\n\n#empty {\n    position: absolute;\n    inset: 0;\n    display: flex;\n    flex-direction: column;\n    align-items: center;\n    justify-content: center;\n    gap: 14px;\n    color: #aaa;\n    font-size: 15px;\n    text-align: center;\n}\n\n#empty[hidden] {\n    display: none;\n}\n\n.empty-icon {\n    color: #52b54b;\n    font-size: 44px;\n}\n\n.tile {\n    position: relative;\n    min-width: 0;\n    min-height: 0;\n    overflow: hidden;\n    border: 0;\n    border-radius: 0;\n    background: #000;\n}\n\n.tile video {\n    display: block;\n    width: 100%;\n    height: 100%;\n    background: #000;\n    object-fit: contain;\n}\n\n.title {\n    position: absolute;\n    top: 0;\n    right: 0;\n    left: 0;\n    z-index: 2;\n    overflow: hidden;\n    padding: 9px 116px 27px 42px;\n    background: linear-gradient(to bottom, rgba(0, 0, 0, .72), transparent);\n    font-size: 13px;\n    font-weight: 600;\n    pointer-events: none;\n    text-overflow: ellipsis;\n    white-space: nowrap;\n}\n\n.drag-handle {\n    position: absolute;\n    top: 6px;\n    left: 7px;\n    z-index: 5;\n    display: grid;\n    width: 27px;\n    height: 28px;\n    padding: 0;\n    border: 0;\n    place-items: center;\n    color: rgba(255, 255, 255, .78);\n    background: transparent;\n    font-size: 18px;\n    line-height: 1;\n    cursor: grab;\n}\n\n.drag-handle:active {\n    cursor: grabbing;\n}\n\n.tile.dragging {\n    opacity: .42;\n}\n\n.tile.drop-before {\n    box-shadow: inset 3px 0 #52b54b;\n}\n\n.tile.drop-after {\n    box-shadow: inset -3px 0 #52b54b;\n}\n\n.close {\n    position: absolute;\n    top: 6px;\n    right: 6px;\n    z-index: 5;\n    width: 30px;\n    height: 30px;\n    padding: 0;\n    border: 0;\n    border-radius: 50%;\n    color: #fff;\n    background: rgba(0, 0, 0, .68);\n    font-size: 20px;\n    line-height: 30px;\n    cursor: pointer;\n}\n\n.close:hover {\n    background: #c62828;\n}\n\n.status {\n    position: absolute;\n    inset: 0;\n    z-index: 3;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n    padding: 20px;\n    color: #fff;\n    background: rgba(0, 0, 0, .62);\n    font-size: 14px;\n    text-align: center;\n    cursor: pointer;\n}\n\n.status[hidden] {\n    display: none;\n}\n\n.controls {\n    position: absolute;\n    right: 0;\n    bottom: 0;\n    left: 0;\n    z-index: 4;\n    display: grid;\n    grid-template-areas:\n        \"segments\"\n        \"seek\"\n        \"transport\";\n    grid-template-rows: auto 18px 30px;\n    gap: 5px;\n    padding: 30px 10px 8px;\n    background: linear-gradient(to bottom, transparent, rgba(0, 0, 0, .9));\n}\n\n.segments {\n    grid-area: segments;\n    display: flex;\n    min-width: 0;\n    justify-content: center;\n}\n\n.segments {\n    position: relative;\n}\n\n.segments::before {\n    position: absolute;\n    top: 50%;\n    left: max(7px, calc(50% - 174px));\n    z-index: 1;\n    color: #75cc6f;\n    content: \"↻\";\n    font-size: 14px;\n    pointer-events: none;\n    transform: translateY(-52%);\n}\n\n.segments::after {\n    position: absolute;\n    top: 50%;\n    right: max(8px, calc(50% - 174px));\n    border-top: 5px solid rgba(255, 255, 255, .72);\n    border-right: 4px solid transparent;\n    border-left: 4px solid transparent;\n    content: \"\";\n    pointer-events: none;\n    transform: translateY(-30%);\n}\n\n.segments select {\n    appearance: none;\n    width: min(100%, 360px);\n    min-width: 0;\n    height: 29px;\n    padding: 0 29px 0 29px;\n    border: 1px solid rgba(255, 255, 255, .18);\n    border-radius: 999px;\n    color: rgba(255, 255, 255, .94);\n    background: linear-gradient(180deg, rgba(40, 40, 40, .9), rgba(17, 17, 17, .9));\n    box-shadow: inset 0 1px rgba(255, 255, 255, .06), 0 2px 8px rgba(0, 0, 0, .2);\n    font: 12px system-ui, sans-serif;\n    cursor: pointer;\n}\n\n.segments select:hover,\n.segments select:focus {\n    border-color: rgba(117, 204, 111, .58);\n    outline: none;\n}\n\n.segments select option {\n    color: #171717;\n    background: #f4f4f4;\n}\n\n.segments select option:checked {\n    color: #fff;\n    background: #397f35;\n}\n\n.segments select option:disabled {\n    color: #666;\n    background: #e7e7e7;\n}\n\n.segments select:disabled {\n    color: rgba(255, 255, 255, .5);\n    cursor: default;\n    opacity: .72;\n}\n\n.seek {\n    position: relative;\n    grid-area: seek;\n    height: 18px;\n}\n\n.seek > input {\n    width: 100%;\n    height: 18px;\n    margin: 0;\n    accent-color: #52b54b;\n    cursor: pointer;\n}\n\n.preview {\n    position: absolute;\n    bottom: 58px;\n    width: var(--preview-width);\n    min-height: 34px;\n    overflow: hidden;\n    border-radius: 6px;\n    color: #fff;\n    background: #111;\n    box-shadow: 0 4px 16px rgba(0, 0, 0, .68);\n    pointer-events: none;\n    transform: translateX(-50%);\n}\n\n.preview.no-image {\n    min-height: 0;\n    border: 1px solid rgba(255, 255, 255, .2);\n    border-radius: 999px;\n    background: rgba(12, 12, 12, .94);\n    box-shadow: 0 3px 12px rgba(0, 0, 0, .52);\n}\n\n.preview[hidden],\n.preview-image[hidden] {\n    display: none;\n}\n\n.preview-image {\n    width: 100%;\n    aspect-ratio: 16 / 9;\n    background: #000 center / contain no-repeat;\n}\n\n.preview-text {\n    overflow: hidden;\n    padding: 5px 8px;\n    font-size: 12px;\n    text-align: center;\n    text-overflow: ellipsis;\n    white-space: nowrap;\n}\n\n.preview.no-image .preview-text {\n    padding: 6px 11px;\n    color: rgba(255, 255, 255, .94);\n    font-size: 11px;\n    font-variant-numeric: tabular-nums;\n    letter-spacing: .02em;\n}\n\n.transport {\n    grid-area: transport;\n    display: flex;\n    min-width: 0;\n    height: 30px;\n    align-items: center;\n    gap: 8px;\n}\n\n.play {\n    flex: none;\n    width: 34px;\n    height: 30px;\n    padding: 0;\n    border: 0;\n    border-radius: 5px;\n    color: #fff;\n    background: rgba(255, 255, 255, .15);\n    font-size: 16px;\n    cursor: pointer;\n}\n\n.volume {\n    display: flex;\n    width: min(34%, 150px);\n    min-width: 76px;\n    align-items: center;\n    gap: 5px;\n}\n\n.volume input {\n    width: 100%;\n    min-width: 0;\n    accent-color: #52b54b;\n}\n\n.time {\n    margin-left: auto;\n    font-size: 11px;\n    white-space: nowrap;\n}\n\n.title,\n.close,\n.status,\n.controls {\n    transition: opacity .18s ease;\n}\n\n.controls-hidden .title,\n.controls-hidden .close,\n.controls-hidden .drag-handle,\n.controls-hidden #windowTools,\n.controls-hidden .status[data-phase=\"clip-cache\"],\n.controls-hidden .status[data-phase=\"memory-ready\"],\n.controls-hidden .controls {\n    opacity: 0;\n    pointer-events: none;\n}\n\n#toast {\n    position: fixed;\n    right: 18px;\n    bottom: 18px;\n    z-index: 20;\n    max-width: min(390px, calc(100vw - 36px));\n    padding: 10px 13px;\n    border: 1px solid rgba(255, 255, 255, .16);\n    border-radius: 7px;\n    color: #fff;\n    background: rgba(20, 20, 20, .95);\n    box-shadow: 0 7px 24px rgba(0, 0, 0, .45);\n    font-size: 13px;\n    opacity: 0;\n    pointer-events: none;\n    transform: translateY(7px);\n    transition: opacity .18s ease, transform .18s ease;\n}\n\n#toast.visible {\n    opacity: 1;\n    transform: translateY(0);\n}\n\n@media (max-width: 620px) {\n    #windowTools {\n        top: 41px;\n    }\n}\n\n@media (max-height: 520px) {\n    .controls {\n        grid-template-areas: \"seek seek\" \"segments transport\";\n        grid-template-columns: minmax(130px, .8fr) minmax(210px, 1.2fr);\n        grid-template-rows: 18px 30px;\n    }\n\n    .segments select {\n        width: 100%;\n    }\n\n    .preview {\n        bottom: 24px;\n    }\n}\n";
+const OPTIONS_HTML = "<!doctype html>\n<html lang=\"zh-CN\">\n<head>\n    <meta charset=\"utf-8\">\n    <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n    <title>Emby 多画面设置</title>\n    <link rel=\"stylesheet\" href=\"options.css\">\n</head>\n<body>\n    <main>\n        <header>\n            <div class=\"mark\">▦</div>\n            <div>\n                <h1>Emby 多画面设置</h1>\n                <p>设置会自动应用到已打开的多画面窗口。</p>\n            </div>\n        </header>\n\n        <section>\n            <h2>适配的网址</h2>\n            <p class=\"explain site-help\">\n                只有列表中的 HTTP/HTTPS 地址会加载 Emby 多画面功能。省略端口表示允许该主机的任意端口。\n            </p>\n            <div class=\"site-editor\">\n                <input id=\"siteInput\" type=\"text\"\n                    placeholder=\"例如：http://192.168.8.8:8096\"\n                    aria-label=\"Emby 服务器网址\">\n                <button id=\"addSite\" type=\"button\">添加网址</button>\n            </div>\n            <div id=\"siteError\" role=\"alert\"></div>\n            <ul id=\"siteList\" aria-label=\"已适配的网址\"></ul>\n            <p class=\"site-note\">支持示例：<code>https://emby.example.com</code>、<code>https://*.example.com</code>。修改后请刷新 Emby 页面。</p>\n        </section>\n\n        <section>\n            <div class=\"setting-head\">\n                <label for=\"previewWidth\">进度预览窗口宽度</label>\n                <output id=\"previewWidthValue\" for=\"previewWidth\">280 px</output>\n            </div>\n            <input id=\"previewWidth\" type=\"range\" min=\"180\" max=\"520\" step=\"10\" value=\"280\">\n            <div class=\"scale\"><span>180 px</span><span>520 px</span></div>\n            <div id=\"previewSample\">\n                <div class=\"sample-image\">预览画面</div>\n                <div class=\"sample-time\">章节名称 · 12:34</div>\n            </div>\n        </section>\n\n        <section>\n            <div class=\"setting-head\">\n                <label for=\"controlsIdleSeconds\">控件自动隐藏延迟</label>\n                <output id=\"controlsIdleSecondsValue\"\n                    for=\"controlsIdleSeconds\">2.5 秒</output>\n            </div>\n            <input id=\"controlsIdleSeconds\" type=\"range\"\n                min=\"0.5\" max=\"30\" step=\"0.5\" value=\"2.5\">\n            <div class=\"scale\"><span>0.5 秒</span><span>30 秒</span></div>\n            <p class=\"site-note\">\n                鼠标、键盘停止操作后，标题、播放控件和缓存进度提示会在设定时间后一起隐藏。\n            </p>\n        </section>\n\n        <section>\n            <h2>循环片段缓存</h2>\n            <p class=\"explain cache-help\">\n                普通播放始终优先直连，不会写入扩展缓存。选择循环片段后才会完整预取对应 HLS 分片，完成后停止服务器转码并从内存循环；关闭画面后立即释放该路缓存。\n            </p>\n            <div class=\"cache-setting\">\n                <label for=\"mediaCacheMode\">片段缓存方式</label>\n                <select id=\"mediaCacheMode\">\n                    <option value=\"memory\">每路内存缓存</option>\n                    <option value=\"off\">关闭缓存，在线循环</option>\n                </select>\n            </div>\n            <div id=\"cacheLimitRow\">\n                <div class=\"setting-head\">\n                    <label for=\"mediaCacheLimitMb\">每路最大缓存</label>\n                    <output id=\"mediaCacheLimitValue\" for=\"mediaCacheLimitMb\">4 GB</output>\n                </div>\n                <input id=\"mediaCacheLimitMb\" type=\"range\"\n                    min=\"256\" max=\"16384\" step=\"256\" value=\"4096\">\n                <div class=\"scale\"><span>256 MB</span><span>16 GB</span></div>\n            </div>\n            <p class=\"site-note\">\n                容量上限只用于片段完整预取。关闭片段缓存后，选中的片段仍会循环，但会继续读取服务器。直连 MP4 的 HTTP 缓存仍由 Chrome 和 Emby 的 Range 策略控制。\n            </p>\n        </section>\n\n        <section>\n            <h2>多画面窗口</h2>\n            <p class=\"explain\">窗口大小会在拖动后自动记忆。重置后，下次新建窗口使用 1100 × 720。</p>\n            <button id=\"resetWindow\" type=\"button\">恢复默认窗口大小</button>\n        </section>\n\n        <div id=\"saved\" role=\"status\">设置已保存</div>\n    </main>\n    <script src=\"options.js\"></script>\n</body>\n</html>\n";
+const OPTIONS_CSS = ":root {\n    color-scheme: dark;\n    background: #111;\n}\n\n* {\n    box-sizing: border-box;\n}\n\nbody {\n    min-width: 520px;\n    margin: 0;\n    color: #eee;\n    background: #111;\n    font-family: system-ui, -apple-system, \"Segoe UI\", sans-serif;\n}\n\nmain {\n    width: min(720px, calc(100vw - 32px));\n    margin: 36px auto;\n}\n\nheader {\n    display: flex;\n    align-items: center;\n    gap: 16px;\n    margin-bottom: 26px;\n}\n\n.mark {\n    color: #52b54b;\n    font-size: 44px;\n}\n\nh1,\nh2,\np {\n    margin: 0;\n}\n\nh1 {\n    font-size: 25px;\n}\n\nh2 {\n    margin-bottom: 9px;\n    font-size: 17px;\n}\n\nheader p,\n.explain {\n    margin-top: 5px;\n    color: #aaa;\n    font-size: 13px;\n}\n\nsection {\n    margin-bottom: 18px;\n    padding: 20px;\n    border: 1px solid #333;\n    border-radius: 10px;\n    background: #1a1a1a;\n}\n\n.site-help {\n    margin-bottom: 13px;\n}\n\n.site-editor {\n    display: flex;\n    align-items: stretch;\n    gap: 8px;\n}\n\n.site-editor input {\n    min-width: 0;\n    flex: 1;\n    padding: 9px 11px;\n    border: 1px solid #444;\n    border-radius: 6px;\n    color: #fff;\n    background: #111;\n    font: 13px system-ui, sans-serif;\n}\n\n.site-editor input:focus {\n    border-color: #62ba5d;\n    outline: none;\n    box-shadow: 0 0 0 2px rgba(82, 181, 75, .18);\n}\n\n.site-editor button {\n    margin-top: 0;\n}\n\n#siteError {\n    min-height: 19px;\n    padding-top: 5px;\n    color: #ff8b8b;\n    font-size: 12px;\n}\n\n#siteList {\n    display: grid;\n    gap: 7px;\n    margin: 5px 0 0;\n    padding: 0;\n    list-style: none;\n}\n\n#siteList li {\n    display: flex;\n    min-width: 0;\n    align-items: center;\n    gap: 10px;\n    padding: 8px 9px 8px 11px;\n    border: 1px solid #333;\n    border-radius: 7px;\n    background: #141414;\n}\n\n#siteList code {\n    overflow: hidden;\n    flex: 1;\n    color: #d7d7d7;\n    font-size: 12px;\n    text-overflow: ellipsis;\n    white-space: nowrap;\n}\n\n#siteList button {\n    margin: 0;\n    padding: 4px 9px;\n    border-color: #493838;\n    color: #ffb0b0;\n    font-size: 12px;\n}\n\n.site-note {\n    margin-top: 11px;\n    color: #888;\n    font-size: 12px;\n}\n\n.site-note code {\n    color: #aaa;\n}\n\n.cache-help {\n    margin-bottom: 15px;\n}\n\n.cache-setting {\n    display: flex;\n    align-items: center;\n    justify-content: space-between;\n    gap: 16px;\n    margin-bottom: 18px;\n}\n\n.cache-setting label {\n    font-weight: 600;\n}\n\n.cache-setting select {\n    min-width: 180px;\n    padding: 8px 30px 8px 10px;\n    border: 1px solid #444;\n    border-radius: 6px;\n    color: #eee;\n    background: #222;\n}\n\n#cacheLimitRow.is-disabled {\n    opacity: .42;\n}\n\n#mediaCacheLimitMb {\n    width: 100%;\n    accent-color: #52b54b;\n}\n\n.setting-head {\n    display: flex;\n    justify-content: space-between;\n    margin-bottom: 14px;\n}\n\n.setting-head label {\n    font-weight: 600;\n}\n\noutput {\n    color: #75cc6f;\n    font-variant-numeric: tabular-nums;\n}\n\n#previewWidth,\n#controlsIdleSeconds {\n    width: 100%;\n    accent-color: #52b54b;\n}\n\n.scale {\n    display: flex;\n    justify-content: space-between;\n    color: #888;\n    font-size: 11px;\n}\n\n#previewSample {\n    width: 280px;\n    max-width: 100%;\n    margin: 22px auto 0;\n    overflow: hidden;\n    border-radius: 7px;\n    background: #0b0b0b;\n    box-shadow: 0 5px 20px rgba(0, 0, 0, .45);\n}\n\n.sample-image {\n    display: flex;\n    aspect-ratio: 16 / 9;\n    align-items: center;\n    justify-content: center;\n    color: #777;\n    background: linear-gradient(135deg, #151515, #292929);\n}\n\n.sample-time {\n    padding: 6px 8px;\n    font-size: 12px;\n    text-align: center;\n}\n\nbutton {\n    margin-top: 15px;\n    padding: 8px 14px;\n    border: 1px solid #4a4a4a;\n    border-radius: 6px;\n    color: #fff;\n    background: #2a2a2a;\n    cursor: pointer;\n}\n\nbutton:hover {\n    background: #343434;\n}\n\n#saved {\n    position: fixed;\n    right: 22px;\n    bottom: 20px;\n    padding: 9px 12px;\n    border-radius: 6px;\n    color: #fff;\n    background: #2d7d2a;\n    opacity: 0;\n    transform: translateY(7px);\n    transition: opacity .18s ease, transform .18s ease;\n}\n\n#saved.visible {\n    opacity: 1;\n    transform: translateY(0);\n}\n";
+const ENTRY_CSS = "#emby-multiwindow-toast {\n    position: fixed;\n    right: 22px;\n    bottom: 22px;\n    z-index: 2147483647;\n    max-width: min(380px, calc(100vw - 44px));\n    padding: 11px 14px;\n    border: 1px solid rgba(255, 255, 255, .16);\n    border-radius: 8px;\n    color: #fff;\n    background: rgba(16, 16, 16, .96);\n    box-shadow: 0 8px 30px rgba(0, 0, 0, .42);\n    font: 14px/1.45 system-ui, -apple-system, \"Segoe UI\", sans-serif;\n    opacity: 0;\n    pointer-events: none;\n    transform: translateY(8px);\n    transition: opacity .18s ease, transform .18s ease;\n}\n\n#emby-multiwindow-toast.is-visible {\n    opacity: 1;\n    transform: translateY(0);\n}\n\n.emby-multiwindow-detail-button {\n    display: inline-flex;\n    align-items: center;\n    gap: .5em;\n}\n\n.emby-multiwindow-icon {\n    color: #52b54b;\n    font-size: 1.15em;\n}\n\n#emby-multiwindow-launcher {\n    position: fixed;\n    right: 22px;\n    bottom: max(22px, env(safe-area-inset-bottom));\n    z-index: 2147483646;\n    display: inline-flex;\n    min-height: 42px;\n    align-items: center;\n    gap: 8px;\n    padding: 0 16px;\n    border: 1px solid rgba(255, 255, 255, .2);\n    border-radius: 999px;\n    color: #fff;\n    background: rgba(18, 18, 18, .92);\n    box-shadow: 0 6px 24px rgba(0, 0, 0, .35);\n    font: 600 14px/1 system-ui, -apple-system, \"Segoe UI\", sans-serif;\n    cursor: pointer;\n    transition: background .16s ease, opacity .16s ease, transform .16s ease;\n}\n\n#emby-multiwindow-launcher[hidden] {\n    display: none;\n}\n\n#emby-multiwindow-launcher:hover {\n    background: rgba(35, 35, 35, .98);\n    transform: translateY(-1px);\n}\n\n#emby-multiwindow-launcher:disabled,\n.emby-multiwindow-detail-button:disabled {\n    cursor: wait;\n    opacity: .62;\n}\n";
+const Hls = globalThis.Hls || unsafeWindow.Hls;
+function runPlayer() {
 (function () {
     'use strict';
 
@@ -39,7 +113,7 @@
     var diagnosticFlushTimer = null;
     var diagnosticRetryAt = 0;
     var diagnosticFlushInFlight = false;
-    var diagnosticFetch = window.fetch.bind(window);
+    var diagnosticFetch = fetch;
 
     function diagnosticSafeUrl(value) {
         if (!value) {
@@ -140,7 +214,7 @@
             videoHeight: video ? video.videoHeight : 0,
             totalFrames: quality ? quality.totalVideoFrames : null,
             droppedFrames: quality ? quality.droppedVideoFrames : null,
-            hlsVersion: window.Hls && Hls.version || '',
+            hlsVersion: Hls && Hls.version || '',
             hlsState: controller && controller.state || '',
             hlsLoading: hls ? !!hls.loadingEnabled : null,
             hlsBuffering: hls ? !!hls.bufferingEnabled : null,
@@ -297,7 +371,7 @@
     diagnosticLog('player-start', {
         extensionVersion: chrome.runtime.getManifest ?
             chrome.runtime.getManifest().version : '',
-        hlsVersion: window.Hls && Hls.version || '',
+        hlsVersion: Hls && Hls.version || '',
         userAgent: navigator.userAgent
     });
     var draining = false;
@@ -2773,7 +2847,7 @@
     function attachStream(slot, stream, startPositionSeconds) {
         stream = stream || slot.stream;
         if (shouldUseHlsJs(slot, stream)) {
-            if (!window.Hls || (typeof Hls.isSupported === 'function' && !Hls.isSupported())) {
+            if (!Hls || (typeof Hls.isSupported === 'function' && !Hls.isSupported())) {
                 return Promise.reject(new Error('当前 Chrome 无法使用 HLS.js 播放此转码流。'));
             }
             var hlsConfig = createHlsConfig(slot, startPositionSeconds);
@@ -3331,4 +3405,1271 @@
     settingsReadyPromise.finally(function () {
         drainPending();
     });
+})();
+
+}
+function runOptions() {
+(function () {
+    'use strict';
+
+    var slider = document.getElementById('previewWidth');
+    var output = document.getElementById('previewWidthValue');
+    var sample = document.getElementById('previewSample');
+    var controlsIdle = document.getElementById('controlsIdleSeconds');
+    var controlsIdleValue =
+        document.getElementById('controlsIdleSecondsValue');
+    var resetButton = document.getElementById('resetWindow');
+    var siteInput = document.getElementById('siteInput');
+    var addSiteButton = document.getElementById('addSite');
+    var siteList = document.getElementById('siteList');
+    var siteError = document.getElementById('siteError');
+    var mediaCacheMode = document.getElementById('mediaCacheMode');
+    var mediaCacheLimit = document.getElementById('mediaCacheLimitMb');
+    var mediaCacheLimitValue = document.getElementById('mediaCacheLimitValue');
+    var cacheLimitRow = document.getElementById('cacheLimitRow');
+    var saved = document.getElementById('saved');
+    var savedTimer = null;
+    var allowedSites = [];
+    var DEFAULT_MEDIA_CACHE_LIMIT_MB = 4096;
+    var MIN_MEDIA_CACHE_LIMIT_MB = 256;
+    var MAX_MEDIA_CACHE_LIMIT_MB = 16384;
+    var MEDIA_CACHE_LIMIT_VERSION = 2;
+    var DEFAULT_CONTROLS_IDLE_SECONDS = 2.5;
+    var MIN_CONTROLS_IDLE_SECONDS = 0.5;
+    var MAX_CONTROLS_IDLE_SECONDS = 30;
+    var DEFAULT_ALLOWED_SITES = [
+        'http://localhost',
+        'https://localhost',
+        'http://127.0.0.1',
+        'https://127.0.0.1',
+        'http://192.168.8.10:8096'
+    ];
+
+    function clampWidth(value) {
+        return Math.max(180, Math.min(520, Math.round(Number(value) || 280)));
+    }
+
+    function render(value) {
+        value = clampWidth(value);
+        slider.value = String(value);
+        output.value = value + ' px';
+        sample.style.width = value + 'px';
+    }
+
+    function clampControlsIdleSeconds(value) {
+        value = Number(value);
+        if (!Number.isFinite(value)) {
+            value = DEFAULT_CONTROLS_IDLE_SECONDS;
+        }
+        return Math.max(
+            MIN_CONTROLS_IDLE_SECONDS,
+            Math.min(
+                MAX_CONTROLS_IDLE_SECONDS,
+                Math.round(value * 2) / 2
+            )
+        );
+    }
+
+    function renderControlsIdle(value) {
+        value = clampControlsIdleSeconds(value);
+        controlsIdle.value = String(value);
+        controlsIdleValue.value = String(value).replace(/\.0$/, '') + ' 秒';
+    }
+
+    function flashSaved(message) {
+        saved.textContent = message || '设置已保存';
+        saved.classList.add('visible');
+        clearTimeout(savedTimer);
+        savedTimer = setTimeout(function () {
+            saved.classList.remove('visible');
+        }, 1700);
+    }
+
+    function normalizeSite(value) {
+        value = String(value || '').trim();
+        if (!value) {
+            throw new Error('请输入 Emby 服务器网址。');
+        }
+        if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) {
+            value = 'http://' + value;
+        }
+        var url;
+        try {
+            url = new URL(value);
+        } catch (error) {
+            throw new Error('网址格式不正确。');
+        }
+        if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+            throw new Error('只支持 http:// 或 https:// 地址。');
+        }
+        if (!url.hostname || url.username || url.password) {
+            throw new Error('请输入不包含账号密码的服务器地址。');
+        }
+        return url.protocol + '//' + url.hostname + (url.port ? ':' + url.port : '');
+    }
+
+    function saveSites(message) {
+        return chrome.storage.sync.set({
+            allowedSites: allowedSites.slice()
+        }).then(function () {
+            flashSaved(message || '网址列表已保存');
+        });
+    }
+
+    function renderSites() {
+        siteList.innerHTML = '';
+        if (!allowedSites.length) {
+            var empty = document.createElement('li');
+            empty.className = 'site-empty';
+            empty.textContent = '没有适配网址，扩展不会注入任何网页。';
+            siteList.appendChild(empty);
+            return;
+        }
+        allowedSites.forEach(function (site) {
+            var item = document.createElement('li');
+            var label = document.createElement('code');
+            label.textContent = site;
+            label.title = site;
+            var remove = document.createElement('button');
+            remove.type = 'button';
+            remove.textContent = '移除';
+            remove.setAttribute('aria-label', '移除 ' + site);
+            remove.addEventListener('click', function () {
+                allowedSites = allowedSites.filter(function (value) {
+                    return value !== site;
+                });
+                renderSites();
+                saveSites();
+            });
+            item.append(label, remove);
+            siteList.appendChild(item);
+        });
+    }
+
+    function addSite() {
+        siteError.textContent = '';
+        try {
+            var site = normalizeSite(siteInput.value);
+            if (allowedSites.includes(site)) {
+                throw new Error('这个网址已经在列表中。');
+            }
+            allowedSites.push(site);
+            allowedSites.sort();
+            renderSites();
+            siteInput.value = '';
+            saveSites();
+        } catch (error) {
+            siteError.textContent = error.message;
+        }
+    }
+
+    function clampCacheLimit(value) {
+        return Math.max(MIN_MEDIA_CACHE_LIMIT_MB, Math.min(MAX_MEDIA_CACHE_LIMIT_MB,
+            Math.round((Number(value) || DEFAULT_MEDIA_CACHE_LIMIT_MB) / 256) * 256));
+    }
+
+    function formatCacheLimit(value) {
+        return value >= 1024 ? String(value / 1024) + ' GB' : value + ' MB';
+    }
+
+    function renderCacheSettings() {
+        var limit = clampCacheLimit(mediaCacheLimit.value);
+        mediaCacheLimit.value = String(limit);
+        mediaCacheLimitValue.value = formatCacheLimit(limit);
+        var disabled = mediaCacheMode.value === 'off';
+        mediaCacheLimit.disabled = disabled;
+        cacheLimitRow.classList.toggle('is-disabled', disabled);
+    }
+
+    slider.addEventListener('input', function () {
+        render(slider.value);
+    });
+    slider.addEventListener('change', function () {
+        var value = clampWidth(slider.value);
+        chrome.storage.sync.set({previewWidth: value}).then(function () {
+            flashSaved();
+        });
+    });
+    controlsIdle.addEventListener('input', function () {
+        renderControlsIdle(controlsIdle.value);
+    });
+    controlsIdle.addEventListener('change', function () {
+        var value = clampControlsIdleSeconds(controlsIdle.value);
+        renderControlsIdle(value);
+        chrome.storage.sync.set({controlsIdleSeconds: value}).then(function () {
+            flashSaved('控件隐藏延迟已保存');
+        });
+    });
+    resetButton.addEventListener('click', function () {
+        chrome.storage.sync.set({
+            windowWidth: 1100,
+            windowHeight: 720
+        }).then(function () {
+            flashSaved('下次打开将使用默认窗口大小');
+        });
+    });
+    addSiteButton.addEventListener('click', addSite);
+    siteInput.addEventListener('keydown', function (event) {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            addSite();
+        }
+    });
+    mediaCacheMode.addEventListener('change', function () {
+        renderCacheSettings();
+        chrome.storage.sync.set({
+            mediaCacheMode: mediaCacheMode.value === 'off' ? 'off' : 'memory'
+        }).then(function () {
+            flashSaved('缓存方式已保存');
+        });
+    });
+    mediaCacheLimit.addEventListener('input', renderCacheSettings);
+    mediaCacheLimit.addEventListener('change', function () {
+        var value = clampCacheLimit(mediaCacheLimit.value);
+        renderCacheSettings();
+        chrome.storage.sync.set({
+            mediaCacheLimitMb: value,
+            mediaCacheLimitVersion: MEDIA_CACHE_LIMIT_VERSION
+        }).then(function () {
+            flashSaved('缓存容量已保存');
+        });
+    });
+
+    chrome.storage.sync.get({
+        previewWidth: 280,
+        controlsIdleSeconds: DEFAULT_CONTROLS_IDLE_SECONDS,
+        allowedSites: DEFAULT_ALLOWED_SITES,
+        mediaCacheMode: 'memory',
+        mediaCacheLimitMb: DEFAULT_MEDIA_CACHE_LIMIT_MB,
+        mediaCacheLimitVersion: 0
+    }).then(function (settings) {
+        var migratedLimit = settings.mediaCacheLimitMb;
+        if (Number(settings.mediaCacheLimitVersion) < MEDIA_CACHE_LIMIT_VERSION &&
+            Number(migratedLimit) === 256) {
+            migratedLimit = DEFAULT_MEDIA_CACHE_LIMIT_MB;
+        }
+        if (Number(settings.mediaCacheLimitVersion) < MEDIA_CACHE_LIMIT_VERSION) {
+            chrome.storage.sync.set({
+                mediaCacheLimitMb: clampCacheLimit(migratedLimit),
+                mediaCacheLimitVersion: MEDIA_CACHE_LIMIT_VERSION
+            }).catch(function (error) {
+                console.warn('[Emby Multi Window] 无法保存缓存容量迁移', error);
+            });
+        }
+        render(settings.previewWidth);
+        renderControlsIdle(settings.controlsIdleSeconds);
+        allowedSites = Array.isArray(settings.allowedSites) ?
+            settings.allowedSites.slice() : DEFAULT_ALLOWED_SITES.slice();
+        renderSites();
+        mediaCacheMode.value = settings.mediaCacheMode === 'off' ?
+            'off' : 'memory';
+        mediaCacheLimit.value = String(clampCacheLimit(migratedLimit));
+        renderCacheSettings();
+    });
+})();
+
+}
+function runEntry() {
+(function () {
+    'use strict';
+
+    if (window.__embyMultiWindowLoaded) {
+        return;
+    }
+    window.__embyMultiWindowLoaded = true;
+
+    var VERSION = '0.7.28';
+    var READY_RETRY_MS = 700;
+    var MODULE_ROOT = './modules/';
+    var SEGMENT_STORAGE_KEY = 'embySegmentLoop.v1';
+    var launcher = null;
+    var toast = null;
+    var toastTimer = null;
+    var readyAttempts = 0;
+    var launcherTimer = null;
+    var launcherObserver = null;
+    var detailRequests = new WeakMap();
+    var playbackManagerPromise = null;
+    var apiClientClassPromise = null;
+    var profileBuilderPromise = null;
+    var pending = new Map();
+
+    function log() {
+        var args = Array.prototype.slice.call(arguments);
+        args.unshift('[Emby Multi Window]');
+        console.log.apply(console, args);
+    }
+
+    function warn() {
+        var args = Array.prototype.slice.call(arguments);
+        args.unshift('[Emby Multi Window]');
+        console.warn.apply(console, args);
+    }
+
+    function moduleDefault(module) {
+        return module && (module.default || module);
+    }
+
+    function importModule(path) {
+        if (!window.Emby || typeof window.Emby.importModule !== 'function') {
+            return Promise.reject(new Error('Emby 模块加载器不可用。'));
+        }
+        return window.Emby.importModule(path).then(moduleDefault);
+    }
+
+    function getPlaybackManager() {
+        if (!playbackManagerPromise) {
+            playbackManagerPromise = importModule('playbackManager').catch(function () {
+                return importModule(MODULE_ROOT + 'common/playback/playbackmanager.js');
+            }).catch(function (error) {
+                playbackManagerPromise = null;
+                throw error;
+            });
+        }
+        return playbackManagerPromise;
+    }
+
+    function getApiClientClass() {
+        if (!apiClientClassPromise) {
+            apiClientClassPromise = importModule(MODULE_ROOT + 'emby-apiclient/apiclient.js')
+                .catch(function (error) {
+                    apiClientClassPromise = null;
+                    throw error;
+                });
+        }
+        return apiClientClassPromise;
+    }
+
+    function getProfileBuilder() {
+        if (!profileBuilderPromise) {
+            profileBuilderPromise = importModule(MODULE_ROOT + 'browserdeviceprofile.js')
+                .catch(function (error) {
+                    profileBuilderPromise = null;
+                    throw error;
+                });
+        }
+        return profileBuilderPromise;
+    }
+
+    function randomId(prefix) {
+        var value;
+        if (crypto && typeof crypto.randomUUID === 'function') {
+            value = crypto.randomUUID().replace(/-/g, '');
+        } else {
+            var bytes = new Uint8Array(16);
+            crypto.getRandomValues(bytes);
+            value = Array.prototype.map.call(bytes, function (byte) {
+                return byte.toString(16).padStart(2, '0');
+            }).join('');
+        }
+        return prefix + value;
+    }
+
+    function showToast(message, duration) {
+        if (!toast) {
+            toast = document.createElement('div');
+            toast.id = 'emby-multiwindow-toast';
+            document.body.appendChild(toast);
+        }
+        toast.textContent = message;
+        toast.classList.add('is-visible');
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(function () {
+            toast.classList.remove('is-visible');
+        }, duration || 3400);
+    }
+
+    function isVideoItem(item) {
+        return !!item && (item.MediaType === 'Video' ||
+            ['Movie', 'Episode', 'Video', 'MusicVideo', 'Trailer', 'Program'].includes(item.Type));
+    }
+
+    function getDisplayName(item) {
+        var parts = [];
+        if (item.SeriesName) {
+            parts.push(item.SeriesName);
+        }
+        if (item.ParentIndexNumber != null && item.IndexNumber != null) {
+            parts.push('S' + String(item.ParentIndexNumber).padStart(2, '0') +
+                'E' + String(item.IndexNumber).padStart(2, '0'));
+        }
+        if (item.Name && !parts.includes(item.Name)) {
+            parts.push(item.Name);
+        }
+        return parts.join(' · ') || item.Name || item.Id || '未知视频';
+    }
+
+    function normalizeSegment(segment, index) {
+        return {
+            id: String(segment.id || segment.Id || index + 1),
+            name: segment.name || segment.Name || ('片段 ' + (index + 1)),
+            startMs: Math.max(0, Number(segment.startMs != null ? segment.startMs : segment.StartMs) || 0),
+            endMs: Math.max(0, Number(segment.endMs != null ? segment.endMs : segment.EndMs) || 0),
+            order: Number(segment.order != null ? segment.order : segment.Order) || index + 1
+        };
+    }
+
+    function getLocalSegments(itemId) {
+        try {
+            var state = JSON.parse(localStorage.getItem(SEGMENT_STORAGE_KEY)) || {};
+            return (state.items && state.items[itemId] || []).map(normalizeSegment)
+                .filter(function (segment) {
+                    return segment.endMs > segment.startMs;
+                });
+        } catch (error) {
+            return [];
+        }
+    }
+
+    function getCurrentPlaybackContext() {
+        return getPlaybackManager().then(function (playbackManager) {
+            var item = playbackManager.currentItem && playbackManager.currentItem();
+            var player = playbackManager.getCurrentPlayer && playbackManager.getCurrentPlayer();
+            var mediaSource = playbackManager.currentMediaSource &&
+                playbackManager.currentMediaSource(player);
+            var positionTicks = 0;
+            try {
+                positionTicks = playbackManager.getCurrentTicks ?
+                    playbackManager.getCurrentTicks(player) :
+                    Math.round((playbackManager.currentTime(player) || 0) * 10000000);
+            } catch (error) {
+                warn('读取原播放器进度失败。', error);
+            }
+            if (!isVideoItem(item)) {
+                throw new Error('请先在 Emby 中播放一个视频。');
+            }
+            return {
+                playbackManager: playbackManager,
+                player: player,
+                item: item,
+                mediaSource: mediaSource,
+                positionTicks: Math.max(0, Number(positionTicks) || 0)
+            };
+        });
+    }
+
+    function createSlotApiClient(baseClient, ApiClientClass) {
+        var deviceId = randomId('emby-multiwindow-');
+        var deviceName = (baseClient.deviceName && baseClient.deviceName()) || 'Chrome';
+        var client = new ApiClientClass(
+            baseClient.serverAddress(),
+            'Emby Multi Window',
+            VERSION,
+            deviceName + ' Multi Window',
+            deviceId,
+            window.devicePixelRatio || 1
+        );
+        if (typeof client.serverInfo === 'function' && typeof baseClient.serverInfo === 'function') {
+            client.serverInfo(baseClient.serverInfo());
+        }
+        client.setAuthenticationInfo({
+            UserId: baseClient.getCurrentUserId(),
+            AccessToken: baseClient.accessToken()
+        });
+        client.enableAutomaticNetworking = false;
+        return client;
+    }
+
+    function getFreshItem(client, item) {
+        return client.getItem(client.getCurrentUserId(), item.Id, {
+            Fields: 'MediaSources,MediaStreams,Path,ProviderIds,Overview,Chapters',
+            EnableImages: false
+        }).catch(function () {
+            return item;
+        });
+    }
+
+    function canBrowserPlayMediaSource(source) {
+        var streams = source.MediaStreams || [];
+        var videoStream = streams.find(function (stream) {
+            return stream.Type === 'Video';
+        }) || {};
+        var codec = String(videoStream.Codec || '').toLowerCase();
+        var container = String(source.Container || '').toLowerCase();
+        var profile = String(videoStream.Profile || '').toLowerCase();
+        var pixelFormat = String(videoStream.PixelFormat || '').toLowerCase();
+        var bitDepth = Number(videoStream.BitDepth) || 0;
+        var width = Number(videoStream.Width) || 0;
+        var height = Number(videoStream.Height) || 0;
+        var frameRate = Number(videoStream.RealFrameRate ||
+            videoStream.AverageFrameRate) || 0;
+        var level = Number(videoStream.Level) || 0;
+        var levelCode = level > 0 && level < 10 ? level * 10 : level;
+        var bitrate = Number(videoStream.BitRate || source.Bitrate) || 0;
+        var mime;
+        if (codec === 'hevc' || codec === 'h265') {
+            return false;
+        }
+        if (codec === 'h264' || codec === 'avc') {
+            if (bitDepth > 8 || /high\s*10|high\s*4:|4:4:4/.test(profile) ||
+                (pixelFormat && !/^(yuvj?420p|nv12)$/.test(pixelFormat)) ||
+                levelCode > 52 ||
+                (width && height && width * height > 3840 * 2160) ||
+                frameRate > 60 || bitrate > 40000000) {
+                return false;
+            }
+            mime = 'video/mp4; codecs="avc1.42E01E"';
+        } else if (codec === 'vp9') {
+            mime = 'video/webm; codecs="vp9"';
+        } else if (codec === 'av1') {
+            mime = 'video/mp4; codecs="av01.0.05M.08"';
+        } else if (container === 'webm') {
+            mime = 'video/webm';
+        } else if (['mp4', 'm4v', 'mov'].includes(container)) {
+            mime = 'video/mp4';
+        } else {
+            return false;
+        }
+        return document.createElement('video').canPlayType(mime) !== '';
+    }
+
+    function requestPlaybackInfo(client, item, profile, context) {
+        var options = {
+            UserId: client.getCurrentUserId(),
+            StartTimeTicks: context.positionTicks || 0,
+            IsPlayback: true,
+            AutoOpenLiveStream: true,
+            // Always ask Emby for an HLS-capable path. The original file URL
+            // is built separately so the player window can choose either one.
+            EnableDirectPlay: false,
+            EnableDirectStream: false,
+            // The visible pane still opens the original file directly. The HLS
+            // path exists specifically for a cached loop, so it must have
+            // encoder-created keyframes at the HLS boundaries. Stream-copying
+            // long-GOP H.264 can produce (for example) 10.4 seconds of media in
+            // a playlist entry advertised as 6 seconds, shifting the cached
+            // content away from the segment timestamps selected on the MP4.
+            AllowVideoStreamCopy: false,
+            AllowAudioStreamCopy: true,
+            MaxStreamingBitrate: 40000000
+        };
+        if (context.mediaSource && context.mediaSource.Id) {
+            options.MediaSourceId = context.mediaSource.Id;
+        }
+        if (context.mediaSource && context.mediaSource.DefaultAudioStreamIndex != null) {
+            options.AudioStreamIndex = context.mediaSource.DefaultAudioStreamIndex;
+        }
+        if (context.mediaSource && context.mediaSource.DefaultSubtitleStreamIndex != null) {
+            options.SubtitleStreamIndex = context.mediaSource.DefaultSubtitleStreamIndex;
+        }
+        return client.getPlaybackInfo(item.Id, options, profile);
+    }
+
+    function chooseMediaSource(playbackInfo, preferredId) {
+        var sources = playbackInfo && playbackInfo.MediaSources || [];
+        if (!sources.length) {
+            throw new Error((playbackInfo && playbackInfo.ErrorCode) ||
+                '服务器没有返回可播放媒体源。');
+        }
+        return sources.find(function (source) {
+            return preferredId && source.Id === preferredId;
+        }) || sources.find(function (source) {
+            return source.DirectStreamUrl;
+        }) || sources.find(function (source) {
+            return source.TranscodingUrl;
+        }) || sources[0];
+    }
+
+    function appendParams(url, params) {
+        var parsed = new URL(url, location.href);
+        Object.keys(params).forEach(function (key) {
+            var value = params[key];
+            if (value != null && value !== '' && !parsed.searchParams.has(key)) {
+                parsed.searchParams.set(key, value);
+            }
+        });
+        return parsed.href;
+    }
+
+    function authenticatedUrl(client, path, extra) {
+        return appendParams(client.getUrl(path), Object.assign({
+            api_key: client.accessToken(),
+            DeviceId: client.deviceId()
+        }, extra || {}));
+    }
+
+    function forceCompatibleTranscodeUrl(url) {
+        var compatibleUrl = new URL(url, location.href);
+        Array.from(compatibleUrl.searchParams.keys()).forEach(function (key) {
+            if (key.toLowerCase() === 'allowvideostreamcopy') {
+                compatibleUrl.searchParams.delete(key);
+            }
+        });
+        compatibleUrl.searchParams.set('VideoCodec', 'h264');
+        compatibleUrl.searchParams.set('AllowVideoStreamCopy', 'false');
+        compatibleUrl.searchParams.set('h264-profile', 'high,main,baseline');
+        compatibleUrl.searchParams.set('h264-level', '52');
+        compatibleUrl.searchParams.set('SegmentContainer', 'ts');
+        compatibleUrl.searchParams.set('TranscodeReasons', 'VideoCodecNotSupported');
+        return compatibleUrl.href;
+    }
+
+    function buildCacheStreamInfo(client, source, playbackInfo) {
+        if (!source.TranscodingUrl) {
+            return null;
+        }
+        var playSessionId = playbackInfo.PlaySessionId || randomId('window-session-');
+        var streamUrl = /^https?:/i.test(source.TranscodingUrl) ?
+            source.TranscodingUrl : client.getUrl(source.TranscodingUrl);
+        // Cache streams must be timestamp-accurate even when the browser can
+        // direct-play the source. Long-GOP stream copy makes Emby's nominal
+        // HLS durations diverge from the TS presentation timestamps.
+        streamUrl = forceCompatibleTranscodeUrl(streamUrl);
+        return {
+            url: appendParams(streamUrl, {
+                api_key: client.accessToken(),
+                DeviceId: client.deviceId(),
+                MediaSourceId: source.Id,
+                PlaySessionId: playSessionId
+            }),
+            playMethod: 'Transcode',
+            playSessionId: playSessionId,
+            isHls: /\.m3u8(?:$|[?#])/i.test(streamUrl) ||
+                String(source.TranscodingSubProtocol || '').toLowerCase() === 'hls'
+        };
+    }
+
+    function getVideoStream(source) {
+        return (source.MediaStreams || []).find(function (stream) {
+            return stream.Type === 'Video';
+        }) || {};
+    }
+
+    function buildDirectStreamInfo(client, item, source, session) {
+        var videoStream = getVideoStream(source);
+        var codec = String(videoStream.Codec || '').toLowerCase();
+        var container = String(source.Container || '').toLowerCase().replace('m4v', 'mp4');
+        var nativeContainer = (
+            ['mp4', 'mov'].includes(container) &&
+            ['h264', 'avc', 'hevc', 'h265', 'av1'].includes(codec)
+        ) || (
+            container === 'webm' &&
+            ['vp9', 'av1'].includes(codec)
+        );
+        if (!nativeContainer) {
+            return null;
+        }
+        var playSessionId = typeof session === 'string' ?
+            session : session && session.playSessionId;
+        playSessionId = playSessionId || randomId('window-session-');
+        var path = 'Videos/' + encodeURIComponent(item.Id) +
+            '/original.' + encodeURIComponent(container);
+        return {
+            url: appendParams(client.getUrl(path), {
+                api_key: client.accessToken(),
+                DeviceId: client.deviceId(),
+                MediaSourceId: source.Id,
+                PlaySessionId: playSessionId,
+                Static: 'true'
+            }),
+            playMethod: 'DirectPlay',
+            playSessionId: playSessionId,
+            isHls: false,
+            nativeTrial: true
+        };
+    }
+
+    function buildPayload(client, item, source, directStream, cacheStream, context) {
+        var stream = cacheStream || directStream;
+        var auth = {
+            PlaySessionId: stream.playSessionId
+        };
+        return {
+            requestId: randomId('request-'),
+            item: JSON.parse(JSON.stringify(item)),
+            mediaSource: JSON.parse(JSON.stringify(source)),
+            stream: stream,
+            directStream: directStream || null,
+            cacheStream: cacheStream || null,
+            // Kept for payload compatibility with an already-open 0.4.x player.
+            fallbackStream: directStream && cacheStream ? cacheStream : null,
+            startPositionTicks: Math.max(0, Number(context.positionTicks) || 0),
+            localSegments: getLocalSegments(item.Id),
+            endpoints: {
+                reportStart: authenticatedUrl(client, 'Sessions/Playing'),
+                reportProgress: authenticatedUrl(client, 'Sessions/Playing/Progress'),
+                reportStopped: authenticatedUrl(client, 'Sessions/Playing/Stopped'),
+                stopEncoding: authenticatedUrl(client, 'Videos/ActiveEncodings/Delete', auth),
+                segments: authenticatedUrl(client,
+                    'SegmentLoop/Segments/' + encodeURIComponent(item.Id)),
+                thumbnailSet: authenticatedUrl(client,
+                    'Items/' + encodeURIComponent(item.Id) + '/ThumbnailSet', {
+                        MediaSourceId: source.Id,
+                        Width: 400
+                    }),
+                thumbnailImage: authenticatedUrl(client,
+                    'Items/' + encodeURIComponent(item.Id) + '/Images/Thumbnail', {
+                        MediaSourceId: source.Id
+                    })
+            }
+        };
+    }
+
+    function preparePayload(context) {
+        if (!isVideoItem(context.item)) {
+            return Promise.reject(new Error('当前详情项目不是可播放视频。'));
+        }
+        var baseClient = window.ApiClient;
+        if (!baseClient || !baseClient.isLoggedIn || !baseClient.isLoggedIn()) {
+            return Promise.reject(new Error('Emby 尚未登录或 ApiClient 不可用。'));
+        }
+        return Promise.all([getApiClientClass(), getProfileBuilder()]).then(function (modules) {
+            var client = createSlotApiClient(baseClient, modules[0]);
+            return getFreshItem(client, context.item).then(function (item) {
+                context.item = item;
+                return Promise.resolve(modules[1]({item: item})).then(function (profile) {
+                    return requestPlaybackInfo(client, item, profile, context);
+                }).then(function (playbackInfo) {
+                    var source = chooseMediaSource(
+                        playbackInfo,
+                        context.mediaSource && context.mediaSource.Id
+                    );
+                    var cacheStream = buildCacheStreamInfo(
+                        client,
+                        source,
+                        playbackInfo
+                    );
+                    var directStream = buildDirectStreamInfo(
+                        client,
+                        item,
+                        source,
+                        cacheStream && cacheStream.playSessionId ||
+                            playbackInfo.PlaySessionId
+                    );
+                    if (!cacheStream && !directStream) {
+                        throw new Error('当前媒体源没有可用的缓存流或浏览器直连流。');
+                    }
+                    return buildPayload(
+                        client,
+                        item,
+                        source,
+                        directStream,
+                        cacheStream,
+                        context
+                    );
+                });
+            });
+        });
+    }
+
+    function pauseOriginal(context) {
+        try {
+            if (context.player && context.playbackManager &&
+                context.playbackManager.isPlaying(context.player)) {
+                context.playbackManager.pause(context.player);
+            }
+        } catch (error) {
+            warn('暂停原播放器失败。', error);
+        }
+    }
+
+    function queueContext(contextPromise, trigger, openInNewWindow) {
+        var preparedWindow = null;
+        try {
+            preparedWindow = window.__embyMultiWindowPrepareWindow ?
+                window.__embyMultiWindowPrepareWindow(!!openInNewWindow) : null;
+        } catch (error) {
+            showToast(error.message || '无法打开多画面窗口。', 4800);
+            return;
+        }
+        if (trigger) {
+            trigger.disabled = true;
+        }
+        Promise.resolve(contextPromise).then(function (context) {
+            return preparePayload(context).then(function (payload) {
+                payload.openInNewWindow = !!openInNewWindow;
+                if (preparedWindow) { payload.targetPlayerId = preparedWindow; }
+                pending.set(payload.requestId, {context: context, trigger: trigger});
+                window.postMessage({
+                    source: 'emby-multiwindow-page',
+                    type: 'ADD_VIDEO',
+                    payload: payload
+                }, location.origin);
+            });
+        }).catch(function (error) {
+            if (trigger && trigger.isConnected) {
+                trigger.disabled = false;
+            }
+            warn(error);
+            showToast(error && error.message ? error.message : '加入多画面失败。', 4800);
+        });
+    }
+
+    function onBridgeResult(event) {
+        var data = event.data;
+        if (event.source !== window || !data || data.source !== 'emby-multiwindow-extension' ||
+            data.type !== 'ADD_VIDEO_RESULT') {
+            return;
+        }
+        var request = pending.get(data.requestId);
+        if (!request) {
+            return;
+        }
+        pending.delete(data.requestId);
+        if (request.trigger && request.trigger.isConnected) {
+            request.trigger.disabled = false;
+        }
+        if (data.ok) {
+            pauseOriginal(request.context);
+            showToast('已发送到多画面窗口：' + getDisplayName(request.context.item));
+        } else {
+            showToast(data.error || '多画面窗口没有接收视频。', 4800);
+        }
+    }
+
+    function detailContext(item) {
+        return {
+            playbackManager: null,
+            player: null,
+            item: item,
+            mediaSource: null,
+            positionTicks: Math.max(0,
+                Number(item && item.UserData && item.UserData.PlaybackPositionTicks) || 0)
+        };
+    }
+
+    function renderDetailButton(view, item) {
+        if (!view || !isVideoItem(item)) {
+            return;
+        }
+        var host = view.querySelector('.mainDetailButtons');
+        if (!host) {
+            return;
+        }
+        var button = host.querySelector('.emby-multiwindow-detail-button');
+        if (!button) {
+            button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'emby-multiwindow-detail-button raised detailButton';
+            button.title = '直接加入多画面窗口；按住 Shift 点击可新建窗口';
+            button.innerHTML = '<span class="emby-multiwindow-icon">▦</span>' +
+                '<span>加入更多画面</span>';
+            button.addEventListener('click', function (event) {
+                event.preventDefault();
+                event.stopPropagation();
+                if (button.embyMultiWindowItem) {
+                    queueContext(
+                        detailContext(button.embyMultiWindowItem),
+                        button,
+                        event.shiftKey
+                    );
+                }
+            });
+            host.appendChild(button);
+        }
+        button.embyMultiWindowItem = item;
+    }
+
+    function onItemShow(event) {
+        var item = event.detail && event.detail.item;
+        var view = event.target && event.target.closest ?
+            event.target.closest('.itemView') : null;
+        view = view || event.target;
+        if (view && item) { view.embyMultiWindowItem = item; }
+        renderDetailButton(view, item);
+    }
+
+    function routeItemId() {
+        var match = location.href.match(/[?&#](?:id|itemid)=([^&#]+)/i);
+        try { return match ? decodeURIComponent(match[1]) : null; }
+        catch (_) { return null; }
+    }
+
+    function scanDetailButtons() {
+        document.querySelectorAll('.mainDetailButtons').forEach(function (host) {
+            if (!host.isConnected || !host.getClientRects().length) { return; }
+            var view = host.closest('.itemView') || host.parentElement;
+            if (!view) { return; }
+            var itemId = routeItemId() || view.getAttribute('data-itemid');
+            var item = view.embyMultiWindowItem;
+            if (item && (!itemId || String(item.Id) === String(itemId))) {
+                renderDetailButton(view, item);
+                return;
+            }
+            var button = host.querySelector('.emby-multiwindow-detail-button');
+            if (button && itemId && String(button.embyMultiWindowItem.Id) !== String(itemId)) { button.remove(); }
+            var client = window.ApiClient;
+            if (!itemId || !client || typeof client.getItem !== 'function' ||
+                typeof client.getCurrentUserId !== 'function' || !client.getCurrentUserId()) { return; }
+            var previous = detailRequests.get(host);
+            if (previous && previous.id === itemId && (previous.pending || Date.now() - previous.time < 5000)) { return; }
+            var request = {id: itemId, pending: true, time: Date.now()};
+            var route = location.href;
+            detailRequests.set(host, request);
+            Promise.resolve().then(function () {
+                return client.getItem(client.getCurrentUserId(), itemId);
+            }).then(function (loaded) {
+                if (detailRequests.get(host) !== request || !host.isConnected ||
+                    !host.getClientRects().length || location.href !== route) { return; }
+                view.embyMultiWindowItem = loaded;
+                renderDetailButton(view, loaded);
+            }).catch(function (error) {
+                warn('读取详情页视频失败。', error);
+            }).finally(function () { request.pending = false; request.time = Date.now(); });
+        });
+    }
+
+    function hasVisiblePlaybackVideo() {
+        return Array.prototype.some.call(document.querySelectorAll('video'), function (video) {
+            return video.isConnected && video.getClientRects().length > 0 &&
+                (video.currentSrc || video.src || video.readyState > 0);
+        });
+    }
+
+    function updateLauncherVisibility() {
+        if (launcher) {
+            launcher.hidden = !hasVisiblePlaybackVideo();
+        }
+        scanDetailButtons();
+    }
+
+    function scheduleLauncherUpdate() {
+        clearTimeout(launcherTimer);
+        launcherTimer = setTimeout(updateLauncherVisibility, 120);
+    }
+
+    function createLauncher() {
+        launcher = document.createElement('button');
+        launcher.id = 'emby-multiwindow-launcher';
+        launcher.type = 'button';
+        launcher.hidden = true;
+        launcher.title = '加入多画面窗口；按住 Shift 点击可新建窗口';
+        launcher.innerHTML = '<span class="emby-multiwindow-icon">▦</span>' +
+            '<span>加入多画面</span>';
+        launcher.addEventListener('click', function (event) {
+            queueContext(getCurrentPlaybackContext(), launcher, event.shiftKey);
+        });
+        document.body.appendChild(launcher);
+        updateLauncherVisibility();
+    }
+
+    function initializeWhenReady() {
+        if (document.body && window.Emby && typeof window.Emby.importModule === 'function' &&
+            window.ApiClient && typeof window.ApiClient.getPlaybackInfo === 'function') {
+            createLauncher();
+            document.addEventListener('itemshow', onItemShow);
+            launcherObserver = new MutationObserver(scheduleLauncherUpdate);
+            launcherObserver.observe(document.body, {
+                childList: true,
+                subtree: true,
+                attributes: true,
+                attributeFilter: ['class', 'src']
+            });
+            window.addEventListener('hashchange', scheduleLauncherUpdate);
+            setInterval(updateLauncherVisibility, 2000);
+            log('Extension initialized.');
+            return;
+        }
+        readyAttempts += 1;
+        setTimeout(initializeWhenReady, readyAttempts < 90 ? READY_RETRY_MS : 3000);
+    }
+
+    if (window.__embyMultiWindowTestMode) {
+        window.__embyMultiWindowCodecTest = {
+            canPlay: canBrowserPlayMediaSource,
+            forceTranscodeUrl: forceCompatibleTranscodeUrl,
+            buildCacheStream: buildCacheStreamInfo,
+            buildDirectTrial: buildDirectStreamInfo
+        };
+    }
+
+    window.addEventListener('message', onBridgeResult);
+    initializeWhenReady();
+})();
+
+}
+// Bundled by tools/build-userscript.cjs inside a private userscript scope.
+const VERSION = '0.7.28';
+const namespace = 'embyMultiWindow.userscript.';
+const listeners = [];
+const runtimeListeners = [];
+function newId() {
+    if (typeof crypto.randomUUID === 'function') { return crypto.randomUUID(); }
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+}
+const playerId = new URL(location.href).searchParams.get('embyMultiWindowId') || newId();
+const mode = new URL(location.href).searchParams.get('embyMultiWindow');
+const localWindows = new Map();
+let workerUrl = null;
+let entryActivated = false;
+
+function getStored(key, fallback) { return GM_getValue(namespace + key, fallback); }
+function setStored(key, value) { GM_setValue(namespace + key, value); }
+function readSettings() { return getStored('settings', {}); }
+function siteAllowed(url) {
+    const defaults = ['http://localhost', 'https://localhost', 'http://127.0.0.1', 'https://127.0.0.1', 'http://192.168.8.10:8096'];
+    return (readSettings().allowedSites || defaults).some(site => {
+        try {
+            const configured = new URL(site), page = new URL(url);
+            return configured.protocol === page.protocol && (!configured.port || configured.port === page.port) &&
+                (configured.hostname === page.hostname || configured.hostname.startsWith('*.') &&
+                    (page.hostname === configured.hostname.slice(2) || page.hostname.endsWith(configured.hostname.slice(1))));
+        } catch (_) { return false; }
+    });
+}
+
+function popupUrl(kind, id) {
+    const url = new URL(location.href);
+    url.searchParams.set('embyMultiWindow', kind);
+    url.searchParams.set('embyMultiWindowId', id);
+    url.hash = '';
+    return url.href;
+}
+function prepareWindow(newWindow, kind = 'player') {
+    const active = getStored('activePlayer', null);
+    const existing = active && getStored('window.' + active, null);
+    const reusable = kind === 'player' && !newWindow && existing &&
+        Date.now() - existing.seen < 15000;
+    if (reusable) {
+        const popup = localWindows.get(active);
+        if (popup && !popup.closed) { popup.focus(); }
+        else { setStored('focusSignal', {id: active, nonce: newId()}); }
+        return active;
+    }
+    const id = reusable ? active : newId();
+    const settings = readSettings();
+    // Called synchronously by the click handler, before PlaybackInfo awaits.
+    const popup = window.open(popupUrl(kind, id), 'emby-multiwindow-' + id,
+        'popup=yes,width=' + (settings.windowWidth || 1100) + ',height=' + (settings.windowHeight || 720));
+    if (!popup) { throw new Error('弹窗被拦截，请允许此 Emby 网站打开弹窗。'); }
+    localWindows.set(id, popup);
+    if (kind === 'player') { setStored('activePlayer', id); }
+    popup.focus();
+    return id;
+}
+
+function gmFetch(url, options = {}) {
+    return new Promise((resolve, reject) => {
+        let request;
+        const signal = options.signal;
+        const abort = () => { if (request) { request.abort(); } reject(new DOMException('Aborted', 'AbortError')); };
+        if (signal && signal.aborted) { abort(); return; }
+        const cleanup = () => { if (signal) { signal.removeEventListener('abort', abort); } };
+        request = GM_xmlhttpRequest({
+            method: options.method || 'GET', url: String(url),
+            headers: Object.fromEntries(new Headers(options.headers || {}).entries()),
+            data: options.body, responseType: 'arraybuffer', anonymous: options.credentials === 'omit',
+            timeout: 30000,
+            onload(response) {
+                cleanup();
+                const body = response.response || new ArrayBuffer(0);
+                const result = new Response(body.byteLength ? body : null, {status: response.status || 502});
+                Object.defineProperty(result, 'url', {value: response.finalUrl || String(url)});
+                resolve(result);
+            },
+            onerror() { cleanup(); reject(new TypeError('网络请求失败')); },
+            ontimeout() { cleanup(); reject(new TypeError('网络请求超时')); },
+            onabort() { cleanup(); reject(new DOMException('Aborted', 'AbortError')); }
+        });
+        if (signal) { signal.addEventListener('abort', abort, {once: true}); }
+    });
+}
+
+function createGmLoaderClass() {
+    return class GmLoader {
+        constructor() {
+            this.stats = {aborted: false, loaded: 0, total: 0, retry: 0, chunkCount: 0,
+                loading: {start: 0, first: 0, end: 0}, parsing: {start: 0, end: 0}, buffering: {start: 0, end: 0}};
+        }
+        load(context, config, callbacks) {
+            this.context = context;
+            this.callbacks = callbacks;
+            this.controller = new AbortController();
+            this.stats.loading.start = performance.now();
+            const headers = {};
+            if (context.rangeEnd > context.rangeStart) { headers.Range = 'bytes=' + context.rangeStart + '-' + (context.rangeEnd - 1); }
+            gmFetch(context.url, {headers, signal: this.controller.signal, credentials: 'omit'})
+                .then(async response => {
+                    if (!response.ok) { throw {code: response.status, text: 'HTTP ' + response.status}; }
+                    const data = context.responseType === 'arraybuffer' ? await response.arrayBuffer() : await response.text();
+                    if (this.stats.aborted || !this.callbacks) { return; }
+                    this.stats.loading.first = this.stats.loading.end = performance.now();
+                    this.stats.loaded = this.stats.total = data.byteLength || data.length;
+                    callbacks.onSuccess({url: response.url, data, code: response.status}, this.stats, context, null);
+                }).catch(error => {
+                    if (!this.stats.aborted && this.callbacks) {
+                        callbacks.onError({code: error.code || 0, text: error.text || error.message}, context, null, this.stats);
+                    }
+                });
+        }
+        abort() {
+            this.stats.aborted = true;
+            if (this.controller) { this.controller.abort(); }
+            if (this.callbacks && this.callbacks.onAbort) { this.callbacks.onAbort(this.stats, this.context, null); }
+        }
+        destroy() { this.abort(); this.callbacks = null; }
+        getCacheAge() { return null; }
+        getResponseHeader() { return null; }
+    };
+}
+
+function storageArea(kind) {
+    return {
+        async get(defaults) {
+            const values = kind === 'sync' ? readSettings() : getStored('queue.' + playerId, {});
+            return defaults === null ? values : Object.assign({}, defaults, values);
+        },
+        async set(values) {
+            if (kind !== 'sync') { throw new Error('会话队列只由窗口通信层写入'); }
+            setStored('settings', Object.assign({}, readSettings(), values));
+        },
+        async remove(keys) {
+            for (const key of Array.isArray(keys) ? keys : [keys]) {
+                // Every queued request is a distinct GM key, avoiding read/modify/write races.
+                GM_deleteValue(namespace + 'request.' + key);
+            }
+        }
+    };
+}
+const chrome = {
+    windows: {getCurrent: async () => ({id: playerId})},
+    storage: {sync: storageArea('sync'), session: storageArea('session'),
+        onChanged: {addListener: callback => listeners.push(callback)}},
+    runtime: {
+        getManifest: () => ({version: VERSION}),
+        getURL(name) {
+            if (name !== 'hls.worker.js') { throw new Error('未知内置资源'); }
+            if (!workerUrl) { workerUrl = URL.createObjectURL(new Blob([WORKER_SOURCE], {type: 'text/javascript'})); }
+            return workerUrl;
+        },
+        onMessage: {addListener: callback => runtimeListeners.push(callback)},
+        async sendMessage(message) {
+            if (message.type === 'EMBY_MULTIWINDOW_NEW_PLAYER') {
+                return {ok: true, windowId: prepareWindow(true)};
+            }
+            throw new Error('未知窗口消息');
+        }
+    }
+};
+
+// Queue snapshots are synthesized from independent keys for safe concurrent adds.
+chrome.storage.session.get = async () => {
+    const queue = {};
+    for (const key of GM_listValues()) {
+        if (!key.startsWith(namespace + 'request.')) { continue; }
+        const envelope = GM_getValue(key);
+        if (!envelope || Date.now() - envelope.created > 120000) {
+            const stopUrl = envelope && envelope.payload && envelope.payload.endpoints && envelope.payload.endpoints.stopEncoding;
+            if (stopUrl) { gmFetch(stopUrl, {method: 'POST'}).catch(() => {}); }
+            GM_deleteValue(key); continue;
+        }
+        if (envelope.targetWindowId === playerId) { queue[key.slice((namespace + 'request.').length)] = envelope; }
+    }
+    return queue;
+};
+GM_addValueChangeListener(namespace + 'settings', (_, oldValue = {}, newValue = {}) => {
+    const changes = {};
+    for (const key of new Set([...Object.keys(oldValue), ...Object.keys(newValue)])) {
+        if (JSON.stringify(oldValue[key]) !== JSON.stringify(newValue[key])) {
+            changes[key] = {oldValue: oldValue[key], newValue: newValue[key]};
+        }
+    }
+    listeners.forEach(callback => callback(changes, 'sync'));
+    if (changes.allowedSites) { activateEntry(); }
+});
+
+function queuePayload(payload) {
+    const id = payload.targetPlayerId || prepareWindow(!!payload.openInNewWindow);
+    const key = 'embyMultiWindow.pending.' + payload.requestId;
+    GM_setValue(namespace + 'request.' + key, {targetWindowId: id, payload, created: Date.now()});
+    GM_setValue(namespace + 'queueSignal', {id, nonce: newId()});
+}
+GM_addValueChangeListener(namespace + 'queueSignal', (_, oldValue, signal) => {
+    if (signal && signal.id === playerId) {
+        runtimeListeners.forEach(callback => callback({type: 'EMBY_MULTIWINDOW_QUEUE_UPDATED', targetWindowId: playerId}));
+    }
+});
+
+function announcePlayer() {
+    for (const key of GM_listValues()) {
+        if (key.startsWith(namespace + 'window.')) {
+            const entry = GM_getValue(key);
+            if (!entry || Date.now() - entry.seen > 60000) { GM_deleteValue(key); }
+        }
+    }
+    setStored('window.' + playerId, {seen: Date.now(), origin: location.origin});
+}
+GM_addValueChangeListener(namespace + 'focusSignal', (_, oldValue, signal) => {
+    if (mode === 'player' && signal && signal.id === playerId) { window.focus(); }
+});
+
+function showSettings() { prepareWindow(true, 'options'); }
+GM_registerMenuCommand('Emby 多画面：设置', showSettings);
+GM_registerMenuCommand('启用此 Emby 网站', () => {
+    const settings = readSettings();
+    setStored('settings', Object.assign({}, settings, {allowedSites: [...new Set([...(settings.allowedSites || []), location.origin])]}));
+    location.reload();
+});
+
+function mountPage(html, css) {
+    const parsed = new DOMParser().parseFromString(html.replace(/<script\b[\s\S]*?<\/script>/gi, '')
+        .replace(/<link\b[^>]*>/gi, ''), 'text/html');
+    const element = document.importNode(parsed.documentElement, true);
+    if (document.documentElement) { document.documentElement.replaceWith(element); }
+    else { document.appendChild(element); }
+    GM_addStyle(css);
+}
+
+function whenDocumentReady(callback) {
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', callback, {once: true});
+    } else { callback(); }
+}
+
+if (mode === 'player' || mode === 'options') {
+    // Prevent the host application's deferred/module bootstrap from sharing the player DOM.
+    const blocker = new MutationObserver(records => records.forEach(record => record.addedNodes.forEach(node => {
+        if (node.nodeType !== 1) { return; }
+        if (node.tagName === 'SCRIPT') { node.remove(); }
+        else { node.querySelectorAll('script').forEach(script => script.remove()); }
+    })));
+    blocker.observe(document, {childList: true, subtree: true});
+    whenDocumentReady(() => blocker.disconnect());
+}
+
+if (mode === 'player') { whenDocumentReady(() => {
+    mountPage(PLAYER_HTML, PLAYER_CSS);
+    announcePlayer();
+    const heartbeat = setInterval(() => {
+        announcePlayer();
+        runtimeListeners.forEach(callback => callback({type: 'EMBY_MULTIWINDOW_QUEUE_UPDATED', targetWindowId: playerId}));
+    }, 3000);
+    window.addEventListener('focus', () => { setStored('activePlayer', playerId); announcePlayer(); });
+    window.addEventListener('resize', () => {
+        setStored('settings', Object.assign({}, readSettings(), {windowWidth: window.outerWidth, windowHeight: window.outerHeight}));
+    });
+    window.addEventListener('pagehide', () => {
+        clearInterval(heartbeat);
+        GM_deleteValue(namespace + 'window.' + playerId);
+        if (workerUrl) { URL.revokeObjectURL(workerUrl); }
+    });
+    Hls.DefaultConfig.loader = createGmLoaderClass();
+    runPlayer();
+}); } else if (mode === 'options') { whenDocumentReady(() => {
+    mountPage(OPTIONS_HTML, OPTIONS_CSS);
+    runOptions();
+}); } else { activateEntry(); }
+
+function activateEntry() {
+    if (mode === 'player' || mode === 'options' || !siteAllowed(location.href) || entryActivated) { return; }
+    entryActivated = true;
+    window.__embyMultiWindowPrepareWindow = newWindow => prepareWindow(newWindow);
+    window.addEventListener('message', event => {
+        const data = event.data;
+        if (event.source !== window || event.origin !== location.origin || !data ||
+            data.source !== 'emby-multiwindow-page' || data.type !== 'ADD_VIDEO' || !data.payload) { return; }
+        try {
+            queuePayload(data.payload);
+            window.postMessage({source: 'emby-multiwindow-extension', type: 'ADD_VIDEO_RESULT',
+                requestId: data.payload.requestId, ok: true}, location.origin);
+        } catch (error) {
+            window.postMessage({source: 'emby-multiwindow-extension', type: 'ADD_VIDEO_RESULT',
+                requestId: data.payload.requestId, ok: false, error: error.message}, location.origin);
+        }
+    });
+    GM_addStyle(ENTRY_CSS);
+    runEntry();
+}
+
 })();

@@ -17,13 +17,15 @@ const {chromium} = require('playwright');
         executablePath: browserPath,
         // Chrome does not load unpacked MV3 extensions in its headless shell.
         // This uses a disposable headed profile and closes it automatically.
-        headless: false,
+        headless: process.env.EMBY_TEST_HEADLESS === '1',
         args: [
             `--disable-extensions-except=${extensionPath}`,
             `--load-extension=${extensionPath}`
         ]
     });
     const failures = [];
+    await context.route('http://127.0.0.1:47831/**', route =>
+        route.fulfill({status: 200, contentType: 'application/json', body: '{"ok":true}'}));
     let extensionRuntimeDetected = false;
     try {
         const extensionsPage = await context.newPage();
@@ -226,9 +228,26 @@ const {chromium} = require('playwright');
                 if (!await page.locator('#newWindow').isVisible()) {
                     failures.push('player.html: new-window control is not visible');
                 }
-                if ((await page.locator('#newWindow').textContent())
-                    .replace(/\s+/g, ' ').trim() !== '＋ 新建窗口') {
-                    failures.push('player.html: new-window control has no visible description');
+                if ((await page.locator('#newWindow').textContent()).trim() !== '＋' ||
+                    await page.locator('#newWindow').getAttribute('aria-label') !== '新建窗口') {
+                    failures.push('player.html: compact new-window control has no accessible description');
+                }
+                const visibleTitles = await page.locator('.tile .title').allTextContents();
+                const tileNames = await page.locator('.tile').evaluateAll(tiles => tiles.map(tile => tile.getAttribute('aria-label')));
+                if (JSON.stringify(visibleTitles) !== JSON.stringify(tileNames)) {
+                    failures.push('player.html: per-video titles do not match the loaded movies');
+                }
+                if (await page.locator('#fullscreen').isVisible()) {
+                    await page.locator('#fullscreen').click();
+                    await page.waitForFunction(() => document.fullscreenElement?.id === 'stage');
+                    await page.waitForFunction(() => document.querySelector('#fullscreen').getAttribute('aria-pressed') === 'true');
+                    if (await page.locator('#fullscreen').getAttribute('aria-pressed') !== 'true') {
+                        failures.push('player.html: fullscreen control does not reflect fullscreen state');
+                    }
+                    await page.keyboard.press('f');
+                    await page.waitForFunction(() => !document.fullscreenElement);
+                    await page.waitForFunction(() => document.querySelector('#fullscreen').getAttribute('aria-pressed') === 'false');
+                    await page.waitForTimeout(250);
                 }
                 if (await page.locator('#playbackStrategy').count()) {
                     failures.push('player.html: obsolete playback strategy button still exists');
@@ -996,7 +1015,7 @@ const {chromium} = require('playwright');
                         clipCacheResult.bytesAfterRelease !== 0) {
                         failures.push('player.html: selected clip was not fully cached before stopping encoding');
                     }
-                    const titlesBefore = await page.locator('.tile .title').allTextContents();
+                    const titlesBefore = await page.locator('.tile').evaluateAll(tiles => tiles.map(tile => tile.getAttribute('aria-label')));
                     if (titlesBefore.length !== 2) {
                         failures.push('player.html: two-video fixture was not created');
                     } else {
@@ -1035,7 +1054,7 @@ const {chromium} = require('playwright');
                         }
                         await page.locator('.drag-handle').first()
                             .dragTo(page.locator('.tile').nth(1));
-                        const titlesAfter = await page.locator('.tile .title').allTextContents();
+                        const titlesAfter = await page.locator('.tile').evaluateAll(tiles => tiles.map(tile => tile.getAttribute('aria-label')));
                         if (titlesAfter[0] === titlesBefore[0]) {
                             failures.push('player.html: two-video drag did not change order');
                         }
@@ -1045,7 +1064,7 @@ const {chromium} = require('playwright');
                     await page.evaluate(() => {
                         document.querySelector('#empty').hidden = true;
                         document.querySelector('#grid').innerHTML = `
-                            <section class="tile">
+                            <section class="tile" aria-label="示例影片 · 第一画面">
                                 <div class="title">示例影片 · 第一画面</div>
                                 <button class="drag-handle">⠿</button>
                                 <button class="close">×</button>
@@ -1070,6 +1089,7 @@ const {chromium} = require('playwright');
                             </section>`;
                         const sampleGrid = document.querySelector('#grid');
                         const secondTile = sampleGrid.firstElementChild.cloneNode(true);
+                        secondTile.setAttribute('aria-label', '示例影片 · 第二画面');
                         secondTile.querySelector('.title').textContent = '示例影片 · 第二画面';
                         sampleGrid.appendChild(secondTile);
                         sampleGrid.style.gridTemplateColumns = 'repeat(2, minmax(0, 1fr))';
